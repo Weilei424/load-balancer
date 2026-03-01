@@ -1,0 +1,118 @@
+package dashboard
+
+import (
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sync/atomic"
+	"time"
+
+	"github.com/Weilei424/load-balancer/internal/lb"
+	"github.com/Weilei424/load-balancer/internal/metrics"
+	"github.com/Weilei424/load-balancer/internal/raftlite"
+)
+
+//go:embed static/index.html
+var dashboardHTML string
+
+// Handler serves the dashboard HTML and SSE stream.
+type Handler struct {
+	node        *raftlite.Node
+	config      *lb.ConfigState
+	metrics     *metrics.Metrics
+	broadcaster *Broadcaster
+}
+
+// NewHandler creates a dashboard Handler.
+func NewHandler(node *raftlite.Node, config *lb.ConfigState, m *metrics.Metrics, b *Broadcaster) *Handler {
+	return &Handler{node: node, config: config, metrics: m, broadcaster: b}
+}
+
+// ServeHTTP dispatches to the HTML or SSE handler.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/events" {
+		h.serveSSE(w, r)
+		return
+	}
+	h.serveHTML(w, r)
+}
+
+func (h *Handler) serveHTML(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(dashboardHTML)) //nolint:errcheck
+}
+
+func (h *Handler) serveSSE(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	ch := h.broadcaster.Subscribe()
+	defer h.broadcaster.Unsubscribe(ch)
+
+	// Send current state immediately.
+	snap := h.buildSnapshot()
+	h.writeSSEEvent(w, snap)
+	flusher.Flush()
+
+	for {
+		select {
+		case data, ok := <-ch:
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (h *Handler) writeSSEEvent(w http.ResponseWriter, snap NodeSnapshot) {
+	data, _ := json.Marshal(snap)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+// BuildSnapshot builds the current dashboard snapshot. Exported so cmd/lb/node.go can use it.
+func (h *Handler) BuildSnapshot() NodeSnapshot {
+	return h.buildSnapshot()
+}
+
+func (h *Handler) buildSnapshot() NodeSnapshot {
+	status := h.node.Status()
+	backends, algo := h.config.Snapshot()
+
+	bsnaps := make([]BackendSnapshot, 0, len(backends))
+	for _, b := range backends {
+		bsnaps = append(bsnaps, BackendSnapshot{
+			URL:       b.URL,
+			Weight:    b.Weight,
+			Healthy:   b.Healthy,
+			ConnCount: atomic.LoadInt64(&b.ConnCount),
+		})
+	}
+
+	m := h.metrics.Snapshot()
+	return NodeSnapshot{
+		ID:            status.ID,
+		Role:          status.Role,
+		Term:          status.Term,
+		LeaderID:      status.LeaderID,
+		CommitIndex:   status.CommitIndex,
+		LastApplied:   status.LastApplied,
+		Algorithm:     algo,
+		Backends:      bsnaps,
+		RequestsTotal: m["lb_requests_total"],
+		ErrorsTotal:   m["lb_errors_total"],
+		Timestamp:     time.Now().UnixMilli(),
+	}
+}
