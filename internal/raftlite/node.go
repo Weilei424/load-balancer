@@ -3,6 +3,7 @@ package raftlite
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"sync"
 	"time"
@@ -28,6 +29,10 @@ type Node struct {
 
 	applyCh   chan LogEntry   // committed entries → state machine consumer
 	proposeCh chan ProposeReq // external Propose() callers → Run() loop
+
+	// rng is a per-node random source so each node gets independent election
+	// timeouts even when processes start at the same wall-clock instant.
+	rng *rand.Rand
 
 	// notifyCh signals the applier goroutine that commitIndex advanced.
 	// Buffered(1) so maybeApply callers never block.
@@ -64,6 +69,15 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 		commitIdx = lastIndex(entries)
 	}
 
+	// Seed per-node RNG: mix wall-clock nanoseconds with a hash of the node ID so
+	// processes started at the same instant still get independent timeouts.
+	seed := time.Now().UnixNano()
+	for _, ch := range cfg.ID {
+		seed ^= int64(ch)
+		seed *= 1099511628211 // FNV-prime
+	}
+	rng := rand.New(rand.NewSource(seed))
+
 	n := &Node{
 		id:        cfg.ID,
 		dataDir:   cfg.DataDir,
@@ -80,6 +94,7 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 			MatchIndex:  make(map[string]int),
 		},
 		role:      Follower,
+		rng:       rng,
 		applyCh:   applyCh,
 		proposeCh: proposeCh,
 		notifyCh:  make(chan struct{}, 1),
@@ -88,7 +103,7 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 		log:       logger,
 	}
 	n.heartbeatTicker = time.NewTicker(heartbeatInterval)
-	n.electionTimer = time.NewTimer(randomElectionTimeout())
+	n.electionTimer = time.NewTimer(n.randomElectionTimeout())
 	return n, nil
 }
 
@@ -294,6 +309,11 @@ func (n *Node) stepDown(newTerm int) {
 	n.resetElectionTimer()
 }
 
+// randomElectionTimeout returns a node-specific random duration in [min, max).
+func (n *Node) randomElectionTimeout() time.Duration {
+	return randomElectionTimeout(n.rng)
+}
+
 // resetElectionTimer restarts the election timer with a fresh random duration.
 // Called with n.mu held.
 func (n *Node) resetElectionTimer() {
@@ -303,7 +323,7 @@ func (n *Node) resetElectionTimer() {
 		default:
 		}
 	}
-	n.electionTimer.Reset(randomElectionTimeout())
+	n.electionTimer.Reset(n.randomElectionTimeout())
 }
 
 // sendHeartbeats replicates to all peers in parallel goroutines.

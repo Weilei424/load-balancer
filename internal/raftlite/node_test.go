@@ -1,6 +1,7 @@
 package raftlite
 
 import (
+	"math/rand"
 	"testing"
 	"time"
 
@@ -25,8 +26,9 @@ func newTestNode(t *testing.T, id string, peers map[string]string) *Node {
 }
 
 func TestElectionTimeoutBounds(t *testing.T) {
+	r := rand.New(rand.NewSource(42))
 	for i := 0; i < 1000; i++ {
-		d := randomElectionTimeout()
+		d := randomElectionTimeout(r)
 		if d < electionTimeoutMin || d >= electionTimeoutMax {
 			t.Fatalf("timeout %v out of bounds [%v, %v)", d, electionTimeoutMin, electionTimeoutMax)
 		}
