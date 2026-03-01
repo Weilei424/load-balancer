@@ -31,13 +31,21 @@ func runNode(args []string) {
 	raftPeers := parsePeers(*peersStr, *id)
 	httpPeers := parsePeers(*httpPeersStr, *id)
 	// Normalise addresses to http:// URLs.
+	// A bare ":port" has an empty host; rewrite to "127.0.0.1:port" first so the
+	// resulting URL is valid for outbound HTTP clients.
 	for k, v := range raftPeers {
 		if !strings.HasPrefix(v, "http") {
+			if strings.HasPrefix(v, ":") {
+				v = "127.0.0.1" + v
+			}
 			raftPeers[k] = "http://" + v
 		}
 	}
 	for k, v := range httpPeers {
 		if !strings.HasPrefix(v, "http") {
+			if strings.HasPrefix(v, ":") {
+				v = "127.0.0.1" + v
+			}
 			httpPeers[k] = "http://" + v
 		}
 	}
