@@ -9,8 +9,9 @@ import (
 )
 
 // raftHTTPClient is shared for all Raft RPC calls.
-// Timeout is deliberately short: longer than heartbeat would queue in-flights.
-var raftHTTPClient = &http.Client{Timeout: 45 * time.Millisecond}
+// The timeout must comfortably exceed local HTTP handling plus fsync/write latency,
+// otherwise vote/append RPCs can fail during elections on slower filesystems.
+var raftHTTPClient = &http.Client{Timeout: 500 * time.Millisecond}
 
 func sendVote(addr string, args RequestVoteArgs) (RequestVoteReply, error) {
 	var reply RequestVoteReply
