@@ -55,6 +55,14 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 	if err != nil {
 		return nil, fmt.Errorf("load log: %w", err)
 	}
+	commitIdx, err := loadCommit(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("load commit: %w", err)
+	}
+	// Clamp to the actual log length in case the log was truncated after the commit was persisted.
+	if commitIdx > lastIndex(entries) {
+		commitIdx = lastIndex(entries)
+	}
 
 	n := &Node{
 		id:        cfg.ID,
@@ -67,8 +75,9 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 			Log:         entries,
 		},
 		vs: VolatileState{
-			NextIndex:  make(map[string]int),
-			MatchIndex: make(map[string]int),
+			CommitIndex: commitIdx,
+			NextIndex:   make(map[string]int),
+			MatchIndex:  make(map[string]int),
 		},
 		role:      Follower,
 		applyCh:   applyCh,
@@ -88,6 +97,8 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 func (n *Node) Run() {
 	n.log.Info().Str("role", n.role.String()).Msg("raft node starting")
 	go n.runApplier()
+	// Replay any committed-but-not-yet-applied entries that survived restart.
+	n.signalApplier()
 
 	for {
 		select {
@@ -126,8 +137,11 @@ func (n *Node) Run() {
 	}
 }
 
-// Stop signals the Raft node to stop.
+// Stop signals the Raft node to stop and fails any in-flight Propose callers.
 func (n *Node) Stop() {
+	n.mu.Lock()
+	n.drainPending(fmt.Errorf("node stopped"))
+	n.mu.Unlock()
 	close(n.stopCh)
 }
 
@@ -139,7 +153,13 @@ func (n *Node) Propose(cmd json.RawMessage) error {
 	case <-n.stopCh:
 		return fmt.Errorf("node stopped")
 	}
-	return <-replyCh
+	// Also escape if the node stops while we wait for the commit reply.
+	select {
+	case err := <-replyCh:
+		return err
+	case <-n.stopCh:
+		return fmt.Errorf("node stopped")
+	}
 }
 
 // Status returns a snapshot of the node's current Raft state.
@@ -251,10 +271,20 @@ func (n *Node) becomeLeader() {
 	n.sendHeartbeats()
 }
 
+// drainPending fails all in-flight Propose callers with err. Called with n.mu held.
+func (n *Node) drainPending(err error) {
+	for idx, ch := range n.pending {
+		ch <- err
+		delete(n.pending, idx)
+	}
+}
+
 // stepDown transitions to Follower. Called with n.mu held.
 func (n *Node) stepDown(newTerm int) {
 	if n.role == Leader {
 		n.log.Info().Int("new_term", newTerm).Msg("leader stepped down")
+		// Fail any Propose callers blocked waiting for a commit that will never arrive.
+		n.drainPending(fmt.Errorf("leader stepped down"))
 	}
 	n.ps.CurrentTerm = newTerm
 	n.ps.VotedFor = ""
@@ -296,7 +326,9 @@ func (n *Node) appendProposal(cmd json.RawMessage) error {
 	}
 	n.ps.Log = append(n.ps.Log, entry)
 	if err := appendLogEntryDisk(n.dataDir, entry); err != nil {
-		n.log.Error().Err(err).Msg("append log disk failed")
+		// Roll back the in-memory append so memory and disk stay consistent.
+		n.ps.Log = n.ps.Log[:len(n.ps.Log)-1]
+		return fmt.Errorf("append log disk: %w", err)
 	}
 	return nil
 }
