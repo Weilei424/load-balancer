@@ -61,6 +61,7 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		} else {
 			n.vs.CommitIndex = li
 		}
+		_ = saveCommit(n.dataDir, n.vs.CommitIndex)
 		n.signalApplier()
 	}
 
@@ -149,6 +150,7 @@ func (n *Node) tryAdvanceCommitIndex() {
 		}
 		if count*2 > total { // majority
 			n.vs.CommitIndex = idx
+			_ = saveCommit(n.dataDir, idx)
 			n.signalApplier()
 			n.notifyPending()
 			break
