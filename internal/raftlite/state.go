@@ -42,6 +42,40 @@ func loadMeta(dataDir string) (int, string, error) {
 	return m.CurrentTerm, m.VotedFor, nil
 }
 
+type persistedCommit struct {
+	CommitIndex int `json:"commit_index"`
+}
+
+// saveCommit atomically persists commitIndex to commit.json via rename.
+func saveCommit(dataDir string, idx int) error {
+	data, err := json.Marshal(persistedCommit{CommitIndex: idx})
+	if err != nil {
+		return fmt.Errorf("marshal commit: %w", err)
+	}
+	tmp := filepath.Join(dataDir, "commit.json.tmp")
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("write commit tmp: %w", err)
+	}
+	return os.Rename(tmp, filepath.Join(dataDir, "commit.json"))
+}
+
+// loadCommit reads commitIndex from commit.json.
+// Returns 0 if the file does not exist (first boot or pre-existing node).
+func loadCommit(dataDir string) (int, error) {
+	data, err := os.ReadFile(filepath.Join(dataDir, "commit.json"))
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read commit: %w", err)
+	}
+	var c persistedCommit
+	if err := json.Unmarshal(data, &c); err != nil {
+		return 0, fmt.Errorf("unmarshal commit: %w", err)
+	}
+	return c.CommitIndex, nil
+}
+
 // appendLogEntryDisk appends a single log entry to log.jsonl (append-only).
 func appendLogEntryDisk(dataDir string, entry LogEntry) error {
 	data, err := json.Marshal(entry)
