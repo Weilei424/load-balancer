@@ -121,6 +121,11 @@ func doAdminRequest(nodesStr, method, path string, body interface{}) {
 			fmt.Println(string(out))
 			return
 		}
+		// 503 means this node has no known leader yet (election in progress); try next.
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			fmt.Fprintf(os.Stderr, "warn: %s has no leader yet, trying next node\n", addr)
+			continue
+		}
 		fmt.Fprintf(os.Stderr, "error from %s: status=%d body=%v\n", addr, resp.StatusCode, result)
 		os.Exit(1)
 	}
