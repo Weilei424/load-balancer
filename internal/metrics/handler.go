@@ -4,7 +4,14 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 )
+
+// gaugeMetrics lists base metric names that are gauges (not monotonic counters).
+var gaugeMetrics = map[string]bool{
+	"raft_term": true,
+	"raft_role": true,
+}
 
 // Handler returns an http.HandlerFunc that writes Prometheus text format metrics.
 // No external Prometheus library is used — hand-rolled per CLAUDE.md.
@@ -19,8 +26,22 @@ func (m *Metrics) Handler() http.Handler {
 		}
 		sort.Strings(keys)
 
+		// Track which base metric names have already had a # TYPE line emitted.
+		emittedType := make(map[string]bool)
 		for _, k := range keys {
-			fmt.Fprintf(w, "# TYPE %s counter\n", k)
+			// Extract base name: strip label set (everything from '{' onward).
+			baseName := k
+			if i := strings.IndexByte(k, '{'); i >= 0 {
+				baseName = k[:i]
+			}
+			if !emittedType[baseName] {
+				typ := "counter"
+				if gaugeMetrics[baseName] {
+					typ = "gauge"
+				}
+				fmt.Fprintf(w, "# TYPE %s %s\n", baseName, typ)
+				emittedType[baseName] = true
+			}
 			fmt.Fprintf(w, "%s %d\n", k, snap[k])
 		}
 	})
