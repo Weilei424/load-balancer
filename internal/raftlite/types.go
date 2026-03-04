@@ -52,10 +52,10 @@ type VolatileState struct {
 
 // Config holds configuration for creating a raftlite Node.
 type Config struct {
-	ID       string
-	Peers    map[string]string // peerID → raft base URL (e.g. "http://127.0.0.1:10001")
+	ID        string
+	Peers     map[string]string // peerID → raft base URL (e.g. "http://127.0.0.1:10001")
 	HTTPPeers map[string]string // peerID → HTTP base URL (e.g. "http://127.0.0.1:9001")
-	DataDir  string
+	DataDir   string
 }
 
 // RequestVoteArgs is the argument struct for RequestVote RPC.
