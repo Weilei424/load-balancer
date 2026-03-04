@@ -38,19 +38,38 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	}
 
 	// Append new entries, handling conflicts.
+	//
+	// Disk errors are treated as hard failures: we return Success=false so the
+	// leader retries rather than accepting entries with memory/disk divergence.
+	// The trade-off is that a node with a broken disk will keep rejecting
+	// AppendEntries until the operator intervenes, which is far safer than
+	// silently losing log entries that later disappear on restart.
 	for _, entry := range args.Entries {
 		existing := termAt(n.ps.Log, entry.Index)
 		if existing != 0 {
 			if existing != entry.Term {
-				// Conflicting entry — truncate and re-append.
-				n.ps.Log = truncateFrom(n.ps.Log, entry.Index)
-				_ = rewriteLogDisk(n.dataDir, n.ps.Log)
+				// Conflicting entry — truncate to just before this index and
+				// rewrite the log file atomically. If the disk write fails,
+				// do NOT update n.ps.Log so memory and disk remain consistent.
+				truncated := truncateFrom(n.ps.Log, entry.Index)
+				if err := rewriteLogDisk(n.dataDir, truncated); err != nil {
+					n.log.Error().Err(err).Int("index", entry.Index).
+						Msg("log truncation disk write failed; rejecting AppendEntries")
+					return reply // Success=false; leader will retry
+				}
+				n.ps.Log = truncated
 			} else {
 				continue // already have this entry
 			}
 		}
 		n.ps.Log = append(n.ps.Log, entry)
-		_ = appendLogEntryDisk(n.dataDir, entry)
+		if err := appendLogEntryDisk(n.dataDir, entry); err != nil {
+			// Roll back the in-memory append so memory and disk stay in sync.
+			n.log.Error().Err(err).Int("index", entry.Index).
+				Msg("log append disk write failed; rejecting AppendEntries")
+			n.ps.Log = n.ps.Log[:len(n.ps.Log)-1]
+			return reply // Success=false; leader will retry
+		}
 	}
 
 	// Advance commit index.
@@ -61,7 +80,12 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		} else {
 			n.vs.CommitIndex = li
 		}
-		_ = saveCommit(n.dataDir, n.vs.CommitIndex)
+		// saveCommit is best-effort: the commit index is re-derived from the log
+		// on restart, so a failure here does not corrupt state — log it and move on.
+		if err := saveCommit(n.dataDir, n.vs.CommitIndex); err != nil {
+			n.log.Error().Err(err).Int("commit_index", n.vs.CommitIndex).
+				Msg("failed to persist commit index")
+		}
 		n.signalApplier()
 	}
 
@@ -150,7 +174,10 @@ func (n *Node) tryAdvanceCommitIndex() {
 		}
 		if count*2 > total { // majority
 			n.vs.CommitIndex = idx
-			_ = saveCommit(n.dataDir, idx)
+			if err := saveCommit(n.dataDir, idx); err != nil {
+				n.log.Error().Err(err).Int("commit_index", idx).
+					Msg("failed to persist commit index")
+			}
 			n.signalApplier()
 			n.notifyPending()
 			break
