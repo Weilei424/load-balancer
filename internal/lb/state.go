@@ -1,9 +1,6 @@
 package lb
 
-import (
-	"sync"
-	"sync/atomic"
-)
+import "sync"
 
 // Algorithm names for routing selection.
 const (
@@ -17,6 +14,10 @@ type Backend struct {
 	Weight    int
 	Healthy   bool
 	ConnCount int64 // atomic; in-flight connections (for least_conn)
+
+	// swrr is the smooth weighted round-robin current weight.
+	// Modified only while ConfigState.swrrMu is held.
+	swrr int
 }
 
 // ConfigState holds the applied configuration for this LB node.
@@ -26,7 +27,10 @@ type ConfigState struct {
 	mu        sync.RWMutex
 	backends  []*Backend
 	algorithm string
-	rrCursor  uint64 // atomic round-robin cursor
+
+	// swrrMu serialises the smooth weighted round-robin per-backend current-weight
+	// updates across concurrent Pick calls.
+	swrrMu sync.Mutex
 }
 
 // NewConfigState creates an empty ConfigState with round-robin as default.
@@ -115,11 +119,6 @@ func (cs *ConfigState) SetHealthy(url string, healthy bool) {
 	if b := cs.findBackend(url); b != nil {
 		b.Healthy = healthy
 	}
-}
-
-// NextRR returns the next round-robin index among healthy backends.
-func (cs *ConfigState) NextRRCursor() uint64 {
-	return atomic.AddUint64(&cs.rrCursor, 1) - 1
 }
 
 // findBackend returns the backend with the given URL, or nil. Caller holds mu.

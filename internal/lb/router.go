@@ -14,22 +14,69 @@ func (cs *ConfigState) Pick() *Backend {
 	case AlgoLeastConn:
 		return pickLeastConn(healthy)
 	default:
-		return pickRoundRobin(cs, healthy)
+		return pickWeightedRoundRobin(cs, healthy)
 	}
 }
 
-func pickRoundRobin(cs *ConfigState, healthy []*Backend) *Backend {
-	idx := cs.NextRRCursor() % uint64(len(healthy))
-	return healthy[idx]
+// pickWeightedRoundRobin implements Nginx's smooth weighted round-robin (SWRR).
+//
+// Each call:
+//  1. Adds each backend's Weight to its swrr current weight.
+//  2. Picks the backend with the highest current weight.
+//  3. Subtracts the total weight sum from the winner's current weight.
+//
+// This distributes requests in exact proportion to weights while keeping the
+// sequence interleaved (no bursts). For equal weights it degenerates to a
+// simple round-robin.
+//
+// cs.swrrMu serialises the per-backend swrr mutations across concurrent Picks.
+func pickWeightedRoundRobin(cs *ConfigState, healthy []*Backend) *Backend {
+	cs.swrrMu.Lock()
+	defer cs.swrrMu.Unlock()
+
+	total := 0
+	for _, b := range healthy {
+		w := b.Weight
+		if w <= 0 {
+			w = 1
+		}
+		b.swrr += w
+		total += w
+	}
+
+	best := healthy[0]
+	for _, b := range healthy[1:] {
+		if b.swrr > best.swrr {
+			best = b
+		}
+	}
+	best.swrr -= total
+	return best
 }
 
+// pickLeastConn selects the backend with the lowest weighted connection score:
+//
+//	score = active_connections / weight
+//
+// A backend with weight=2 can handle twice as many concurrent connections as a
+// weight=1 backend before being considered "busier". Equal scores break in
+// favour of the first backend in the list.
 func pickLeastConn(healthy []*Backend) *Backend {
 	best := healthy[0]
-	min := atomic.LoadInt64(&best.ConnCount)
+	bw := best.Weight
+	if bw <= 0 {
+		bw = 1
+	}
+	bestScore := float64(atomic.LoadInt64(&best.ConnCount)) / float64(bw)
+
 	for _, b := range healthy[1:] {
-		c := atomic.LoadInt64(&b.ConnCount)
-		if c < min {
-			min = c
+		w := b.Weight
+		if w <= 0 {
+			w = 1
+		}
+		score := float64(atomic.LoadInt64(&b.ConnCount)) / float64(w)
+		if score < bestScore {
+			bestScore = score
 			best = b
 		}
 	}

@@ -103,6 +103,49 @@ func TestApplyAddRemoveBackend(t *testing.T) {
 	}
 }
 
+func TestWeightedRoundRobin(t *testing.T) {
+	cs := NewConfigState()
+	cs.Apply(Command{Op: OpAddBackend, URL: "http://b1", Weight: 2})
+	cs.Apply(Command{Op: OpAddBackend, URL: "http://b2", Weight: 1})
+
+	counts := map[string]int{}
+	n := 300
+	for i := 0; i < n; i++ {
+		b := cs.Pick()
+		if b == nil {
+			t.Fatal("Pick returned nil")
+		}
+		counts[b.URL]++
+	}
+	// b1 (weight=2) should get ~200 requests, b2 (weight=1) ~100.
+	// Allow ±20 variance (±10% of total).
+	if counts["http://b1"] < 180 || counts["http://b1"] > 220 {
+		t.Errorf("b1 got %d/%d requests (want ~200)", counts["http://b1"], n)
+	}
+	if counts["http://b2"] < 80 || counts["http://b2"] > 120 {
+		t.Errorf("b2 got %d/%d requests (want ~100)", counts["http://b2"], n)
+	}
+}
+
+func TestWeightedLeastConn(t *testing.T) {
+	cs := &ConfigState{algorithm: AlgoLeastConn}
+	// b1: weight=2, conns=4 → score = 4/2 = 2.0
+	// b2: weight=1, conns=1 → score = 1/1 = 1.0
+	// b2 should always win because its weighted score is lower.
+	b1 := &Backend{URL: "http://b1", Weight: 2, Healthy: true}
+	b2 := &Backend{URL: "http://b2", Weight: 1, Healthy: true}
+	atomic.StoreInt64(&b1.ConnCount, 4)
+	atomic.StoreInt64(&b2.ConnCount, 1)
+	cs.backends = []*Backend{b1, b2}
+
+	for i := 0; i < 20; i++ {
+		b := cs.Pick()
+		if b == nil || b.URL != "http://b2" {
+			t.Fatalf("expected b2 (lower weighted score), got %v", b)
+		}
+	}
+}
+
 func TestApplySetAlgorithm(t *testing.T) {
 	cs := NewConfigState()
 	cs.Apply(Command{Op: OpSetAlgorithm, Algorithm: AlgoLeastConn})
