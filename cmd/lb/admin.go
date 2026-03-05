@@ -41,6 +41,7 @@ func adminAddBackend(args []string) {
 	url := fs.String("url", "", "backend URL (required)")
 	weight := fs.Int("weight", 1, "backend weight")
 	nodes := fs.String("nodes", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "LB node HTTP addresses")
+	leader := fs.String("leader", "", "send directly to this leader address, skipping node discovery")
 	fs.Parse(args) //nolint:errcheck
 
 	if *url == "" {
@@ -48,20 +49,21 @@ func adminAddBackend(args []string) {
 		os.Exit(1)
 	}
 	body := map[string]interface{}{"url": *url, "weight": *weight}
-	doAdminRequest(*nodes, "POST", "/admin/backends", body)
+	doAdminRequest(*nodes, *leader, "POST", "/admin/backends", body)
 }
 
 func adminRemoveBackend(args []string) {
 	fs := flag.NewFlagSet("remove-backend", flag.ExitOnError)
 	url := fs.String("url", "", "backend URL (required)")
 	nodes := fs.String("nodes", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "LB node HTTP addresses")
+	leader := fs.String("leader", "", "send directly to this leader address, skipping node discovery")
 	fs.Parse(args) //nolint:errcheck
 
 	if *url == "" {
 		fmt.Fprintln(os.Stderr, "--url is required")
 		os.Exit(1)
 	}
-	doAdminRequest(*nodes, "DELETE", "/admin/backends", map[string]string{"url": *url})
+	doAdminRequest(*nodes, *leader, "DELETE", "/admin/backends", map[string]string{"url": *url})
 }
 
 func adminSetWeight(args []string) {
@@ -69,23 +71,34 @@ func adminSetWeight(args []string) {
 	url := fs.String("url", "", "backend URL (required)")
 	weight := fs.Int("weight", 1, "new weight")
 	nodes := fs.String("nodes", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "LB node HTTP addresses")
+	leader := fs.String("leader", "", "send directly to this leader address, skipping node discovery")
 	fs.Parse(args) //nolint:errcheck
 
-	doAdminRequest(*nodes, "PATCH", "/admin/backends", map[string]interface{}{"url": *url, "weight": *weight})
+	doAdminRequest(*nodes, *leader, "PATCH", "/admin/backends", map[string]interface{}{"url": *url, "weight": *weight})
 }
 
 func adminSetAlgorithm(args []string) {
 	fs := flag.NewFlagSet("set-algorithm", flag.ExitOnError)
 	algo := fs.String("algorithm", "round_robin", "algorithm: round_robin|least_conn")
 	nodes := fs.String("nodes", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "LB node HTTP addresses")
+	leader := fs.String("leader", "", "send directly to this leader address, skipping node discovery")
 	fs.Parse(args) //nolint:errcheck
 
-	doAdminRequest(*nodes, "PUT", "/admin/algorithm", map[string]string{"algorithm": *algo})
+	doAdminRequest(*nodes, *leader, "PUT", "/admin/algorithm", map[string]string{"algorithm": *algo})
 }
 
-// doAdminRequest tries each node in turn, following 307 redirects to the leader.
-func doAdminRequest(nodesStr, method, path string, body interface{}) {
-	addrs := strings.Split(nodesStr, ",")
+// doAdminRequest sends an admin command to the cluster.
+// If leader is non-empty, it sends directly to that address (still follows 307 redirects
+// in case the address turns out to be a follower).
+// Otherwise it iterates the comma-separated nodesStr, trying each in turn.
+func doAdminRequest(nodesStr, leader, method, path string, body interface{}) {
+	var addrs []string
+	if leader != "" {
+		addrs = []string{strings.TrimSpace(leader)}
+	} else {
+		addrs = strings.Split(nodesStr, ",")
+	}
+
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
