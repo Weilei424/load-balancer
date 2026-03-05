@@ -113,6 +113,15 @@ func runNode(args []string) {
 				roleInt = 2
 			}
 			met.SetRaft(s.Term, roleInt)
+
+			// Update per-backend conn count pointers for /metrics.
+			backends, _ := config.Snapshot()
+			connMap := make(map[string]*int64, len(backends))
+			for _, b := range backends {
+				connMap[b.URL] = &b.ConnCount
+			}
+			met.SetBackends(connMap)
+
 			broadcaster.Broadcast(dashHandler.BuildSnapshot())
 		}
 	}()
