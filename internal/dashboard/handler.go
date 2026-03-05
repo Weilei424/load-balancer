@@ -103,16 +103,18 @@ func (h *Handler) buildSnapshot() NodeSnapshot {
 
 	m := h.metrics.Snapshot()
 	return NodeSnapshot{
-		ID:            status.ID,
-		Role:          status.Role,
-		Term:          status.Term,
-		LeaderID:      status.LeaderID,
-		CommitIndex:   status.CommitIndex,
-		LastApplied:   status.LastApplied,
-		Algorithm:     algo,
-		Backends:      bsnaps,
-		RequestsTotal: m["lb_requests_total"],
-		ErrorsTotal:   m["lb_errors_total"],
-		Timestamp:     time.Now().UnixMilli(),
+		ID:                status.ID,
+		Role:              status.Role,
+		Term:              status.Term,
+		LeaderID:          status.LeaderID,
+		CommitIndex:       status.CommitIndex,
+		LastApplied:       status.LastApplied,
+		LogLength:         status.LogLength,
+		Algorithm:         algo,
+		Backends:          bsnaps,
+		RequestsTotal:     m["lb_requests_total"],
+		RequestsPerSecond: h.metrics.RequestRate(),
+		ErrorsTotal:       m["lb_errors_total"],
+		Timestamp:         time.Now().UnixMilli(),
 	}
 }

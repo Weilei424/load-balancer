@@ -19,12 +19,14 @@ type NodeSnapshot struct {
 	LeaderID    string            `json:"leader_id"`
 	CommitIndex int               `json:"commit_index"`
 	LastApplied int               `json:"last_applied"`
+	LogLength   int               `json:"log_length"`
 	Algorithm   string            `json:"algorithm"`
 	Backends    []BackendSnapshot `json:"backends"`
-	// Requests proxied since last snapshot
-	RequestsTotal int64 `json:"requests_total"`
-	ErrorsTotal   int64 `json:"errors_total"`
-	Timestamp     int64 `json:"timestamp"` // unix millis
+	// Traffic counters
+	RequestsTotal     int64   `json:"requests_total"`
+	RequestsPerSecond float64 `json:"requests_per_second"`
+	ErrorsTotal       int64   `json:"errors_total"`
+	Timestamp         int64   `json:"timestamp"` // unix millis
 }
 
 // LeaderChangeEvent is recorded in the timeline when leadership changes.
