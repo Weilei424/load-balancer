@@ -69,6 +69,23 @@ Detailed runbooks live in:
 - [Testing Guide](docs/testing.md)
 - [Deployment And Operations](docs/deployment.md)
 
+## Tradeoffs
+
+**Follower redirect vs. forward**
+Admin write requests land on a follower are answered with an HTTP 307 redirect pointing to the current leader. The alternative — having the follower transparently forward the request body to the leader — was not chosen because it would require buffering a potentially large request body, duplicating the response, and handling mid-stream errors. A redirect keeps follower logic minimal and lets the client own the retry.
+
+**No snapshot / log compaction in v1**
+The Raft log grows without bound. On restart, replay is proportional to log length. Snapshotting (§7 of the Raft paper) is the natural next feature but was deferred to keep the scope reasonable for a learning project.
+
+**Weighted round-robin implementation**
+Routing uses Nginx's smooth weighted round-robin (SWRR) rather than expanding each backend into `weight` virtual slots. SWRR uses O(n) memory regardless of total weight and produces a well-interleaved sequence with no bursts, while the slot-expansion approach uses O(Σweight) memory and can produce runs of the same backend.
+
+**Bootstrap behaviour**
+The proxy returns 503 until at least one backend is committed through the Raft log and applied to the local config state. Waiting indefinitely was not chosen because it would obscure startup errors. Operators can observe the dashboard or `/metrics` to confirm when backends become available.
+
+**Election timeout range**
+150–300 ms was chosen to be fast enough for a visible demo but is not tuned for production. The values are constants in `internal/raftlite/ticker.go` and can be changed without touching the rest of the implementation.
+
 ## Scope Notes
 
 Implemented:
