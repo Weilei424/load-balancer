@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Weilei424/load-balancer/internal/dashboard"
@@ -128,9 +132,10 @@ func runNode(args []string) {
 
 	// Raft RPC server (dedicated port).
 	raftMux := raftNode.Handler()
+	raftServer := &http.Server{Addr: *raftAddr, Handler: raftMux}
 	go func() {
 		logger.Info().Str("addr", *raftAddr).Msg("raft server starting")
-		if err := http.ListenAndServe(*raftAddr, raftMux); err != nil {
+		if err := raftServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatal().Err(err).Msg("raft server error")
 		}
 	}()
@@ -158,9 +163,34 @@ func runNode(args []string) {
 		proxy.ServeHTTP(w, r)
 	})
 
+	mainServer := &http.Server{Addr: *httpAddr, Handler: mainMux}
+
+	// Graceful shutdown on SIGTERM / SIGINT.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, os.Interrupt)
+	go func() {
+		<-sigCh
+		logger.Info().Msg("shutting down")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// Stop accepting new HTTP traffic first so in-flight requests can complete.
+		mainServer.Shutdown(ctx) //nolint:errcheck
+		raftServer.Shutdown(ctx) //nolint:errcheck
+
+		// Stop raft and health checker; drain applyCh so the applier goroutine exits.
+		raftNode.Stop()
+		healthChecker.Stop()
+		for range applyCh {
+		}
+
+		os.Exit(0)
+	}()
+
 	logger.Info().Str("addr", *httpAddr).Msg("http server starting")
 	fmt.Printf("dashboard: http://localhost%s/\n", *httpAddr)
-	if err := http.ListenAndServe(*httpAddr, mainMux); err != nil {
+	if err := mainServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal().Err(err).Msg("http server error")
 	}
 }
