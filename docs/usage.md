@@ -107,6 +107,16 @@ To target a specific set of nodes:
   --nodes "http://localhost:9001,http://localhost:9002,http://localhost:9003"
 ```
 
+To send directly to a known leader address (skipping node discovery):
+
+```bash
+./bin/lb admin add-backend \
+  --url http://localhost:9101 \
+  --leader http://localhost:9001
+```
+
+If `--leader` points at a follower, the 307 redirect is still followed automatically.
+
 ## Change Configuration
 
 Remove a backend:
@@ -115,10 +125,18 @@ Remove a backend:
 ./bin/lb admin remove-backend --url http://localhost:9103
 ```
 
-Set a backend weight:
+Set a backend weight (higher weight means proportionally more traffic under weighted round-robin):
 
 ```bash
 ./bin/lb admin set-weight --url http://localhost:9101 --weight 2
+./bin/lb admin set-weight --url http://localhost:9102 --weight 1
+# Result: ~67% of requests go to 9101, ~33% to 9102
+```
+
+Use `--leader` to send directly:
+
+```bash
+./bin/lb admin set-weight --url http://localhost:9101 --weight 3 --leader http://localhost:9001
 ```
 
 Switch routing algorithm:
