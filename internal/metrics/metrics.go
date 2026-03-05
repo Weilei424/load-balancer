@@ -4,6 +4,7 @@ package metrics
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Metrics holds all observable counters for the LB node.
@@ -17,14 +18,61 @@ type Metrics struct {
 	mu              sync.RWMutex
 	backendRequests map[string]*int64 // per-backend request counters
 	backendErrors   map[string]*int64 // per-backend error counters
+
+	// rate window: updated every second by rateLoop.
+	rw rateWindow
+
+	// backendConns holds pointers to Backend.ConnCount atomics, keyed by URL.
+	// Updated by SetBackends from the periodic broadcast goroutine.
+	bcMu         sync.RWMutex
+	backendConns map[string]*int64
 }
 
-// New creates a zero-valued Metrics instance.
+// rateWindow stores the previous total and the computed req/s rate.
+type rateWindow struct {
+	mu        sync.Mutex
+	prevTotal int64
+	rate      float64
+}
+
+// New creates a zero-valued Metrics instance and starts the rate-tracking goroutine.
 func New() *Metrics {
-	return &Metrics{
+	m := &Metrics{
 		backendRequests: make(map[string]*int64),
 		backendErrors:   make(map[string]*int64),
+		backendConns:    make(map[string]*int64),
 	}
+	go m.rateLoop()
+	return m
+}
+
+// rateLoop samples RequestsTotal every second and computes the req/s rate.
+func (m *Metrics) rateLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		current := atomic.LoadInt64(&m.RequestsTotal)
+		m.rw.mu.Lock()
+		m.rw.rate = float64(current - m.rw.prevTotal)
+		m.rw.prevTotal = current
+		m.rw.mu.Unlock()
+	}
+}
+
+// RequestRate returns the current requests-per-second rate (computed over the last second).
+func (m *Metrics) RequestRate() float64 {
+	m.rw.mu.Lock()
+	defer m.rw.mu.Unlock()
+	return m.rw.rate
+}
+
+// SetBackends updates the set of backend ConnCount pointers used for /metrics output.
+// conns maps backend URL → pointer to the Backend's atomic ConnCount field.
+// Called from the periodic broadcast goroutine in node.go.
+func (m *Metrics) SetBackends(conns map[string]*int64) {
+	m.bcMu.Lock()
+	m.backendConns = conns
+	m.bcMu.Unlock()
 }
 
 // IncRequest increments the global and per-backend request counter.
@@ -74,18 +122,26 @@ func (m *Metrics) SetRaft(term int, role int32) {
 // Snapshot returns a stable copy for rendering.
 func (m *Metrics) Snapshot() map[string]int64 {
 	result := map[string]int64{
-		"lb_requests_total": atomic.LoadInt64(&m.RequestsTotal),
-		"lb_errors_total":   atomic.LoadInt64(&m.ErrorsTotal),
-		"raft_term":         atomic.LoadInt64(&m.RaftTerm),
-		"raft_role":         int64(atomic.LoadInt32(&m.RaftRole)),
+		"lb_requests_total":      atomic.LoadInt64(&m.RequestsTotal),
+		"lb_errors_total":        atomic.LoadInt64(&m.ErrorsTotal),
+		"raft_term":              atomic.LoadInt64(&m.RaftTerm),
+		"raft_role":              int64(atomic.LoadInt32(&m.RaftRole)),
+		"lb_requests_per_second": int64(m.RequestRate()),
 	}
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	for url, c := range m.backendRequests {
 		result["lb_backend_requests{url=\""+url+"\"}"] = atomic.LoadInt64(c)
 	}
 	for url, c := range m.backendErrors {
 		result["lb_backend_errors{url=\""+url+"\"}"] = atomic.LoadInt64(c)
 	}
+	m.mu.RUnlock()
+
+	m.bcMu.RLock()
+	for url, ptr := range m.backendConns {
+		result["lb_backend_conn_count{url=\""+url+"\"}"] = atomic.LoadInt64(ptr)
+	}
+	m.bcMu.RUnlock()
+
 	return result
 }
