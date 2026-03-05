@@ -48,13 +48,15 @@ td{padding:.5rem;border-bottom:1px solid #1e293b}
       <tr><td>Leader</td><td id="leader">—</td></tr>
       <tr><td>CommitIndex</td><td id="commit">—</td></tr>
       <tr><td>LastApplied</td><td id="applied">—</td></tr>
+      <tr><td>LogLength</td><td id="log-length">—</td></tr>
     </table>
   </div>
   <div class="card">
     <h2>Traffic</h2>
     <div class="stat" id="reqs">0</div>
     <div style="margin-top:.25rem;color:#94a3b8;font-size:.8rem">total requests</div>
-    <div style="margin-top:.5rem;color:#f87171;font-size:.8rem">errors: <span id="errs">0</span></div>
+    <div style="margin-top:.5rem;color:#38bdf8;font-size:1rem;font-weight:600"><span id="rps">0</span> req/s</div>
+    <div style="margin-top:.25rem;color:#f87171;font-size:.8rem">errors: <span id="errs">0</span></div>
   </div>
   <div class="card">
     <h2>Routing Algorithm</h2>
@@ -99,7 +101,9 @@ function update(d) {
   document.getElementById('leader').textContent = d.leader_id || '(none)';
   document.getElementById('commit').textContent = d.commit_index ?? '—';
   document.getElementById('applied').textContent = d.last_applied ?? '—';
+  document.getElementById('log-length').textContent = d.log_length ?? '—';
   document.getElementById('reqs').textContent = d.requests_total ?? 0;
+  document.getElementById('rps').textContent = (d.requests_per_second ?? 0).toFixed(1);
   document.getElementById('errs').textContent = d.errors_total ?? 0;
   document.getElementById('algo').textContent = d.algorithm || '—';
 
