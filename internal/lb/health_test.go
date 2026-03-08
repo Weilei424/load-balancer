@@ -97,6 +97,33 @@ func TestHealthCheckerRecovery(t *testing.T) {
 	}
 }
 
+// TestHealthCheckerStopsCleanly verifies that Stop() returns promptly even
+// when backends are being polled concurrently.
+func TestHealthCheckerStopsCleanly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cs := NewConfigState()
+	startBackend(cs, srv.URL)
+
+	hc := newFastChecker(cs, 20*time.Millisecond)
+	hc.Start()
+
+	done := make(chan struct{})
+	go func() {
+		hc.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HealthChecker.Stop() did not return within 2s")
+	}
+}
+
 // TestHealthCheckerTimeout verifies that a backend whose /health endpoint
 // hangs longer than the client timeout is treated as unhealthy.
 func TestHealthCheckerTimeout(t *testing.T) {

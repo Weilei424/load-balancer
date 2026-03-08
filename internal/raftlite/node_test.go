@@ -224,6 +224,35 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	}
 }
 
+// TestNodeStopDoesNotCloseApplyCh verifies that Stop() does not close applyCh.
+// The caller owns the channel; closing it from inside the node would be a bug
+// (double-close if the caller also closes it, or premature close that breaks the
+// caller's range loop).
+func TestNodeStopDoesNotCloseApplyCh(t *testing.T) {
+	applyCh := make(chan LogEntry, 64)
+	proposeCh := make(chan ProposeReq, 4)
+	n, err := NewNode(Config{
+		ID:        "n1",
+		Peers:     nil,
+		HTTPPeers: make(map[string]string),
+		DataDir:   t.TempDir(),
+	}, applyCh, proposeCh, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+	go n.Run()
+	n.Stop()
+	// If applyCh were closed by Stop(), sending here would panic.
+	// The channel must still be open and writable after Stop() returns.
+	select {
+	case applyCh <- LogEntry{}:
+		// drain it so the goroutine below doesn't leak
+		<-applyCh
+	default:
+		// buffered send would only block if the channel is full, not closed
+	}
+}
+
 func TestNodeStopsCleanly(t *testing.T) {
 	n := newTestNode(t, "n1", nil)
 	done := make(chan struct{})

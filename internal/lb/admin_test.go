@@ -226,6 +226,61 @@ func TestAdminHandlerBadRequestSetAlgorithm(t *testing.T) {
 	}
 }
 
+func TestAdminHandlerSetWeightValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing url", `{"weight":2}`},
+		{"empty url", `{"url":"","weight":2}`},
+		{"zero weight", `{"url":"http://b:9101","weight":0}`},
+		{"negative weight", `{"url":"http://b:9101","weight":-1}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockRaftNode{isLeader: true}
+			h := newTestHandler(mock)
+			req := httptest.NewRequest(http.MethodPatch, "/admin/backends", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d: %s", rr.Code, rr.Body.String())
+			}
+			if mock.proposeCalled {
+				t.Fatal("Propose must not be called for invalid input")
+			}
+		})
+	}
+}
+
+func TestAdminHandlerSetAlgorithmValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty algorithm", `{"algorithm":""}`},
+		{"unknown algorithm", `{"algorithm":"random"}`},
+		{"typo", `{"algorithm":"round-robin"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockRaftNode{isLeader: true}
+			h := newTestHandler(mock)
+			req := httptest.NewRequest(http.MethodPut, "/admin/algorithm", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d: %s", rr.Code, rr.Body.String())
+			}
+			if mock.proposeCalled {
+				t.Fatal("Propose must not be called for invalid algorithm")
+			}
+		})
+	}
+}
+
 func TestAdminHandlerProposeError(t *testing.T) {
 	mock := &mockRaftNode{isLeader: true, proposeErr: errors.New("not leader")}
 	h := newTestHandler(mock)
