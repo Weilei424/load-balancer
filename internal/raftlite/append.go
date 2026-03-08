@@ -53,7 +53,7 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 				// do NOT update n.ps.Log so memory and disk remain consistent.
 				truncated := truncateFrom(n.ps.Log, entry.Index)
 				if err := rewriteLogDisk(n.dataDir, truncated); err != nil {
-					n.log.Error().Err(err).Int("index", entry.Index).
+					n.withStateLocked(n.log.Error().Err(err).Int("index", entry.Index)).
 						Msg("log truncation disk write failed; rejecting AppendEntries")
 					return reply // Success=false; leader will retry
 				}
@@ -65,7 +65,7 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		n.ps.Log = append(n.ps.Log, entry)
 		if err := appendLogEntryDisk(n.dataDir, entry); err != nil {
 			// Roll back the in-memory append so memory and disk stay in sync.
-			n.log.Error().Err(err).Int("index", entry.Index).
+			n.withStateLocked(n.log.Error().Err(err).Int("index", entry.Index)).
 				Msg("log append disk write failed; rejecting AppendEntries")
 			n.ps.Log = n.ps.Log[:len(n.ps.Log)-1]
 			return reply // Success=false; leader will retry
@@ -83,7 +83,7 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		// saveCommit is best-effort: the commit index is re-derived from the log
 		// on restart, so a failure here does not corrupt state — log it and move on.
 		if err := saveCommit(n.dataDir, n.vs.CommitIndex); err != nil {
-			n.log.Error().Err(err).Int("commit_index", n.vs.CommitIndex).
+			n.withStateLocked(n.log.Error().Err(err).Int("commit_index", n.vs.CommitIndex)).
 				Msg("failed to persist commit index")
 		}
 		n.signalApplier()
@@ -175,7 +175,7 @@ func (n *Node) tryAdvanceCommitIndex() {
 		if count*2 > total { // majority
 			n.vs.CommitIndex = idx
 			if err := saveCommit(n.dataDir, idx); err != nil {
-				n.log.Error().Err(err).Int("commit_index", idx).
+				n.withStateLocked(n.log.Error().Err(err).Int("commit_index", idx)).
 					Msg("failed to persist commit index")
 			}
 			n.signalApplier()
