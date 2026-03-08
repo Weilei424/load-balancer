@@ -93,6 +93,10 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	return reply
 }
 
+// maxEntriesPerRPC limits how many log entries are sent in a single AppendEntries
+// RPC. Batching improves catchup throughput without unbounded payload sizes.
+const maxEntriesPerRPC = 64
+
 // replicateToPeer sends AppendEntries to a single peer. Runs in its own goroutine.
 func (n *Node) replicateToPeer(peerID, peerAddr string) {
 	n.mu.Lock()
@@ -104,6 +108,9 @@ func (n *Node) replicateToPeer(peerID, peerAddr string) {
 	prevIdx := nextIdx - 1
 	prevTerm := termAt(n.ps.Log, prevIdx)
 	rawEntries := logSlice(n.ps.Log, prevIdx)
+	if len(rawEntries) > maxEntriesPerRPC {
+		rawEntries = rawEntries[:maxEntriesPerRPC]
+	}
 	entries := make([]LogEntry, len(rawEntries))
 	copy(entries, rawEntries)
 	args := AppendEntriesArgs{
