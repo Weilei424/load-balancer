@@ -113,12 +113,17 @@ func (cs *ConfigState) Algorithm() string {
 }
 
 // SetHealthy marks a backend healthy or unhealthy by URL.
-func (cs *ConfigState) SetHealthy(url string, healthy bool) {
+// Returns true if the health state changed.
+func (cs *ConfigState) SetHealthy(url string, healthy bool) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	if b := cs.findBackend(url); b != nil {
-		b.Healthy = healthy
+		if b.Healthy != healthy {
+			b.Healthy = healthy
+			return true
+		}
 	}
+	return false
 }
 
 // findBackend returns the backend with the given URL, or nil. Caller holds mu.
