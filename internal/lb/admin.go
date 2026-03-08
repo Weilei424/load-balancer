@@ -107,6 +107,14 @@ func (ah *AdminHandler) handleSetWeight(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	if req.URL == "" {
+		http.Error(w, `{"error":"url required"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Weight <= 0 {
+		http.Error(w, `{"error":"weight must be positive"}`, http.StatusBadRequest)
+		return
+	}
 	ah.propose(w, Command{Op: OpSetWeight, URL: req.URL, Weight: req.Weight})
 }
 
@@ -116,6 +124,10 @@ func (ah *AdminHandler) handleSetAlgorithm(w http.ResponseWriter, r *http.Reques
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Algorithm != AlgoRoundRobin && req.Algorithm != AlgoLeastConn {
+		http.Error(w, `{"error":"algorithm must be \"round_robin\" or \"least_conn\""}`, http.StatusBadRequest)
 		return
 	}
 	ah.propose(w, Command{Op: OpSetAlgorithm, Algorithm: req.Algorithm})
