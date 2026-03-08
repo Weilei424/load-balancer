@@ -110,7 +110,9 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 // Run starts the Raft main event loop and the applier goroutine.
 // Blocks until Stop() is called.
 func (n *Node) Run() {
-	n.log.Info().Str("role", n.role.String()).Msg("raft node starting")
+	n.mu.Lock()
+	n.withStateLocked(n.log.Info()).Msg("raft node starting")
+	n.mu.Unlock()
 	go n.runApplier()
 	// Replay any committed-but-not-yet-applied entries that survived restart.
 	n.signalApplier()
@@ -118,7 +120,9 @@ func (n *Node) Run() {
 	for {
 		select {
 		case <-n.stopCh:
-			n.log.Info().Msg("raft node stopping")
+			n.mu.Lock()
+			n.withStateLocked(n.log.Info()).Msg("raft node stopping")
+			n.mu.Unlock()
 			return
 
 		case <-n.electionTimer.C:
@@ -220,6 +224,12 @@ func (n *Node) LeaderHTTPAddr() string {
 	return n.httpPeers[lid]
 }
 
+// withStateLocked attaches term, role, and leader_id to e.
+// Caller must hold n.mu.
+func (n *Node) withStateLocked(e *zerolog.Event) *zerolog.Event {
+	return e.Int("term", n.ps.CurrentTerm).Str("role", n.role.String()).Str("leader_id", n.leaderID)
+}
+
 // ---- Internal methods ----
 
 // startElection starts a new election. Called with n.mu held.
@@ -242,7 +252,7 @@ func (n *Node) startElection() {
 	votes := 1 // voted for self
 	var voteMu sync.Mutex
 
-	n.log.Info().Int("term", term).Msg("starting election")
+	n.withStateLocked(n.log.Info()).Msg("starting election")
 
 	for peerID, peerAddr := range n.peers {
 		go func(pid, addr string) {
@@ -282,7 +292,7 @@ func (n *Node) becomeLeader() {
 		n.vs.NextIndex[id] = li + 1
 		n.vs.MatchIndex[id] = 0
 	}
-	n.log.Info().Int("term", n.ps.CurrentTerm).Msg("became leader")
+	n.withStateLocked(n.log.Info()).Msg("became leader")
 	n.sendHeartbeats()
 }
 
@@ -297,7 +307,7 @@ func (n *Node) drainPending(err error) {
 // stepDown transitions to Follower. Called with n.mu held.
 func (n *Node) stepDown(newTerm int) {
 	if n.role == Leader {
-		n.log.Info().Int("new_term", newTerm).Msg("leader stepped down")
+		n.log.Info().Int("term", newTerm).Str("role", "follower").Str("leader_id", "").Msg("leader stepped down")
 		// Fail any Propose callers blocked waiting for a commit that will never arrive.
 		n.drainPending(fmt.Errorf("leader stepped down"))
 	}
