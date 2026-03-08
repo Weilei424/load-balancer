@@ -179,11 +179,9 @@ func runNode(args []string) {
 		mainServer.Shutdown(ctx) //nolint:errcheck
 		raftServer.Shutdown(ctx) //nolint:errcheck
 
-		// Stop raft and health checker; drain applyCh so the applier goroutine exits.
+		// Stop raft and health checker.
 		raftNode.Stop()
 		healthChecker.Stop()
-		for range applyCh {
-		}
 
 		os.Exit(0)
 	}()
