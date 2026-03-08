@@ -62,8 +62,7 @@ func (hc *HealthChecker) checkOne(b *Backend) {
 	if resp != nil {
 		resp.Body.Close()
 	}
-	if b.Healthy != healthy {
+	if hc.config.SetHealthy(b.URL, healthy) {
 		hc.log.Info().Str("url", b.URL).Bool("healthy", healthy).Msg("backend health changed")
-		hc.config.SetHealthy(b.URL, healthy)
 	}
 }
