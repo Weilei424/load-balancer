@@ -11,16 +11,13 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// TestBatchAppendEntriesCatchup verifies that a lagging follower catches up in
-// ≤ ceil(numEntries/maxEntriesPerRPC)+1 AppendEntries RPCs rather than one per entry.
-func TestBatchAppendEntriesCatchup(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+// runBatchCatchupTest boots a 3-node cluster, stops a follower, commits
+// numEntries on the remaining majority, then restarts the follower with a
+// fresh log and asserts it catches up in ≤ maxRPCs AppendEntries RPCs.
+func runBatchCatchupTest(t *testing.T, numEntries, maxRPCs int) {
+	t.Helper()
 
-	const numEntries = 20
-
-	// Phase 1: allocate listeners so we know all addresses up front.
+	// Pre-allocate all 3 listeners so addresses are known before nodes start.
 	lns := make([]net.Listener, 3)
 	for i := range lns {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -36,8 +33,7 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		addrs[id] = "http://" + lns[i].Addr().String()
 	}
 
-	// Phase 2: start all 3 nodes so a leader can be elected.
-	dataDirs := make([]string, 3)
+	// Start all 3 nodes so a leader can be elected.
 	var nodes []*clusterNode
 	for i, id := range ids {
 		peers := make(map[string]string)
@@ -48,13 +44,11 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		}
 		applyCh := make(chan LogEntry, 128)
 		proposeCh := make(chan ProposeReq, 4)
-		dir := t.TempDir()
-		dataDirs[i] = dir
 		n, err := NewNode(Config{
 			ID:        id,
 			Peers:     peers,
 			HTTPPeers: make(map[string]string),
-			DataDir:   dir,
+			DataDir:   t.TempDir(),
 		}, applyCh, proposeCh, zerolog.Nop())
 		if err != nil {
 			t.Fatalf("NewNode %s: %v", id, err)
@@ -65,24 +59,20 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		nodes = append(nodes, &clusterNode{Node: n, ln: lns[i], srv: srv})
 	}
 
-	// Wait for a leader to be elected.
 	leader := waitForLeader(t, nodes, 3*time.Second)
 
-	// Find a follower (not the leader) to stop.
+	// Pick any follower to stop.
 	var followerIdx int
 	var followerNode *clusterNode
-	followerAddr := ""
 	for i, cn := range nodes {
 		if !cn.IsLeader() {
 			followerIdx = i
 			followerNode = cn
-			followerAddr = lns[i].Addr().String()
 			break
 		}
 	}
-
-	// Determine the peer map for the follower's replacement node.
 	followerID := ids[followerIdx]
+	followerAddr := lns[followerIdx].Addr().String()
 	followerPeers := make(map[string]string)
 	for pid, pa := range addrs {
 		if pid != followerID {
@@ -90,10 +80,10 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		}
 	}
 
-	// Stop the follower (closes its Run loop, HTTP server, and listener).
+	// Stop the follower. The remaining two nodes (leader + 1 follower) have
+	// a 2/3 majority and can still commit.
 	followerNode.Stop()
 
-	// Phase 3: stop the other non-leader + leader cleanup on test exit.
 	defer func() {
 		for i, cn := range nodes {
 			if i != followerIdx {
@@ -102,8 +92,7 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		}
 	}()
 
-	// Phase 4: propose numEntries on the leader. The remaining two nodes
-	// (leader + one follower) constitute a majority (2/3) and can commit.
+	// Propose numEntries and wait for all of them to commit.
 	cmd, _ := json.Marshal(map[string]string{"op": "batch-test"})
 	for i := 0; i < numEntries; i++ {
 		if err := leader.Propose(cmd); err != nil {
@@ -111,7 +100,6 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		}
 	}
 
-	// Verify the leader has committed all entries.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if leader.Status().CommitIndex >= numEntries {
@@ -123,8 +111,7 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		t.Fatalf("leader commitIndex=%d, want >=%d", leader.Status().CommitIndex, numEntries)
 	}
 
-	// Phase 5: restart the follower at the same address with a fresh log.
-	// Wrap its handler to count how many AppendEntries RPCs it receives.
+	// Restart the follower with a fresh (empty) log and a counting handler.
 	var appendRPCCount int64
 
 	newLn, err := net.Listen("tcp", followerAddr)
@@ -138,13 +125,12 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		ID:        followerID,
 		Peers:     followerPeers,
 		HTTPPeers: make(map[string]string),
-		DataDir:   t.TempDir(), // fresh data dir — follower starts with empty log
+		DataDir:   t.TempDir(), // fresh — no prior log
 	}, applyCh2, proposeCh2, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("NewNode (restart) %s: %v", followerID, err)
 	}
 
-	// Wrap the raft handler to count /raft/append calls.
 	base := n2.Handler()
 	counting := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/raft/append" {
@@ -163,7 +149,7 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 	go restarted.srv.Serve(newLn) //nolint:errcheck
 	go n2.Run()
 
-	// Phase 6: wait for the restarted follower to catch up.
+	// Wait for the restarted follower to apply all entries.
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if n2.Status().LastApplied >= numEntries {
@@ -171,19 +157,39 @@ func TestBatchAppendEntriesCatchup(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	got := atomic.LoadInt64(&appendRPCCount)
 	if n2.Status().LastApplied < numEntries {
 		t.Fatalf("restarted follower lastApplied=%d, want >=%d (appendRPCs=%d)",
-			n2.Status().LastApplied, numEntries, atomic.LoadInt64(&appendRPCCount))
+			n2.Status().LastApplied, numEntries, got)
 	}
 
-	// Assert that catchup required ≤ ceil(numEntries/maxEntriesPerRPC)+1 RPCs.
-	// With numEntries=20 and maxEntriesPerRPC=64: ceil(20/64)+1 = 2.
-	maxExpected := int64((numEntries+maxEntriesPerRPC-1)/maxEntriesPerRPC) + 1
-	got := atomic.LoadInt64(&appendRPCCount)
-	if got > maxExpected {
-		t.Fatalf("catchup took %d AppendEntries RPCs, want ≤%d (maxEntriesPerRPC=%d)",
-			got, maxExpected, maxEntriesPerRPC)
+	if got > int64(maxRPCs) {
+		t.Fatalf("catchup took %d AppendEntries RPCs, want ≤%d (numEntries=%d, maxEntriesPerRPC=%d)",
+			got, maxRPCs, numEntries, maxEntriesPerRPC)
 	}
-	t.Logf("catchup complete: %d AppendEntries RPCs for %d entries (max allowed: %d)",
-		got, numEntries, maxExpected)
+	t.Logf("catchup: %d entries in %d AppendEntries RPCs (≤%d allowed)", numEntries, got, maxRPCs)
+}
+
+// TestBatchAppendEntriesCatchup verifies the basic batch behavior:
+// 20 entries fit in one batch so catchup takes ≤ ceil(20/64)+1 = 2 RPCs.
+func TestBatchAppendEntriesCatchup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	const numEntries = 20
+	maxRPCs := (numEntries+maxEntriesPerRPC-1)/maxEntriesPerRPC + 1 // ceil(20/64)+1 = 2
+	runBatchCatchupTest(t, numEntries, maxRPCs)
+}
+
+// TestBatchAppendEntriesSplit verifies the acceptance criterion from upgrade-plan.md:
+// a fresh follower with 100 committed entries behind converges in ≤ 3 AppendEntries
+// RPCs. This exercises the batch-splitting path (100 > maxEntriesPerRPC=64) so the
+// leader must send at least two non-empty batches.
+func TestBatchAppendEntriesSplit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	const numEntries = 100
+	// ceil(100/64)+1 = 2+1 = 3: up to 1 rejection round-trip + 2 payload batches.
+	runBatchCatchupTest(t, numEntries, 3)
 }
