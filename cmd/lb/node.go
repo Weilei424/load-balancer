@@ -71,6 +71,9 @@ func runNode(args []string) {
 		Snapshotter: func() []byte {
 			return config.SnapshotData()
 		},
+		ApplySnapshot: func(data []byte) error {
+			return config.RestoreSnapshot(data)
+		},
 		SnapshotThreshold: 1000,
 	}, applyCh, proposeCh, logger)
 	if err != nil {
@@ -99,18 +102,6 @@ func runNode(args []string) {
 				Str("url", cmd.URL).
 				Int("index", entry.Index).
 				Msg("applied command")
-			broadcaster.Broadcast(dashHandler.BuildSnapshot())
-		}
-	}()
-
-	// Drain SnapshotCh: apply snapshots to the state machine (startup + InstallSnapshot).
-	go func() {
-		for snap := range raftNode.SnapshotCh() {
-			if err := config.RestoreSnapshot(snap.Data); err != nil {
-				logger.Error().Err(err).Msg("restore snapshot failed")
-				continue
-			}
-			logger.Info().Int("last_included_index", snap.LastIncludedIndex).Msg("snapshot applied")
 			broadcaster.Broadcast(dashHandler.BuildSnapshot())
 		}
 	}()
