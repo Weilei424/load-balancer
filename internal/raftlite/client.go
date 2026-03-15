@@ -13,6 +13,9 @@ import (
 // otherwise vote/append RPCs can fail during elections on slower filesystems.
 var raftHTTPClient = &http.Client{Timeout: 500 * time.Millisecond}
 
+// snapshotHTTPClient uses a longer timeout because snapshot payloads can be large.
+var snapshotHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
 func sendVote(addr string, args RequestVoteArgs) (RequestVoteReply, error) {
 	var reply RequestVoteReply
 	if err := doPostJSON(raftHTTPClient, addr+"/raft/vote", args, &reply); err != nil {
@@ -24,6 +27,14 @@ func sendVote(addr string, args RequestVoteArgs) (RequestVoteReply, error) {
 func sendAppend(addr string, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	var reply AppendEntriesReply
 	if err := doPostJSON(raftHTTPClient, addr+"/raft/append", args, &reply); err != nil {
+		return reply, err
+	}
+	return reply, nil
+}
+
+func sendInstallSnapshot(addr string, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	var reply InstallSnapshotReply
+	if err := doPostJSON(snapshotHTTPClient, addr+"/raft/install-snapshot", args, &reply); err != nil {
 		return reply, err
 	}
 	return reply, nil
