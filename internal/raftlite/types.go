@@ -50,12 +50,39 @@ type VolatileState struct {
 	MatchIndex map[string]int
 }
 
+// Snapshot holds a point-in-time compaction of the log.
+type Snapshot struct {
+	LastIncludedIndex int    `json:"last_included_index"`
+	LastIncludedTerm  int    `json:"last_included_term"`
+	Data              []byte `json:"data"` // JSON-marshalled state machine
+}
+
+// InstallSnapshotArgs is the argument struct for InstallSnapshot RPC.
+type InstallSnapshotArgs struct {
+	Term              int    `json:"term"`
+	LeaderID          string `json:"leader_id"`
+	LastIncludedIndex int    `json:"last_included_index"`
+	LastIncludedTerm  int    `json:"last_included_term"`
+	Data              []byte `json:"data"`
+}
+
+// InstallSnapshotReply is the response for InstallSnapshot RPC.
+type InstallSnapshotReply struct {
+	Term    int  `json:"term"`
+	Success bool `json:"success"`
+}
+
 // Config holds configuration for creating a raftlite Node.
 type Config struct {
 	ID        string
 	Peers     map[string]string // peerID → raft base URL (e.g. "http://127.0.0.1:10001")
 	HTTPPeers map[string]string // peerID → HTTP base URL (e.g. "http://127.0.0.1:9001")
 	DataDir   string
+	// Snapshotter is called to serialize the state machine when a snapshot is triggered.
+	// Nil disables auto-snapshotting.
+	Snapshotter func() []byte
+	// SnapshotThreshold triggers a snapshot when len(log) exceeds this value. Default: 1000.
+	SnapshotThreshold int
 }
 
 // RequestVoteArgs is the argument struct for RequestVote RPC.
