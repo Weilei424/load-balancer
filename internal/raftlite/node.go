@@ -150,9 +150,13 @@ func (n *Node) Run() {
 	n.mu.Unlock()
 	// Apply the startup snapshot synchronously, before the applier goroutine starts,
 	// so the state machine is fully restored before any log-tail entries are replayed.
+	// A restore failure is unrecoverable: replaying the log on top of an unrestored
+	// state machine would silently corrupt state, so we stop the node instead.
 	if n.snapshot.LastIncludedIndex > 0 && n.applySnapshot != nil {
 		if err := n.applySnapshot(n.snapshot.Data); err != nil {
-			n.log.Error().Err(err).Msg("startup snapshot apply failed")
+			n.log.Error().Err(err).Msg("startup snapshot apply failed; stopping node to prevent state corruption")
+			n.Stop()
+			return
 		}
 	}
 	go n.runApplier()
