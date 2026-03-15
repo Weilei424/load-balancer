@@ -22,18 +22,30 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 	// Log consistency check at PrevLogIndex.
 	if args.PrevLogIndex > 0 {
-		ourTerm := termAt(n.ps.Log, args.PrevLogIndex)
-		if ourTerm == 0 {
-			// We don't have the entry at PrevLogIndex.
-			reply.ConflictIndex = lastIndex(n.ps.Log) + 1
-			reply.ConflictTerm = 0
-			return reply
-		}
-		if ourTerm != args.PrevLogTerm {
-			// Term mismatch — send fast-rollback hint.
-			reply.ConflictTerm = ourTerm
-			reply.ConflictIndex = firstIndexOfTerm(n.ps.Log, ourTerm)
-			return reply
+		if args.PrevLogIndex <= n.snapshot.LastIncludedIndex {
+			// Entry was compacted into the snapshot.
+			if args.PrevLogIndex == n.snapshot.LastIncludedIndex &&
+				args.PrevLogTerm != n.snapshot.LastIncludedTerm {
+				// Snapshot boundary term mismatch — rare but possible after split-brain.
+				reply.ConflictIndex = n.snapshot.LastIncludedIndex
+				reply.ConflictTerm = n.snapshot.LastIncludedTerm
+				return reply
+			}
+			// PrevLogIndex < snapshotLastIndex: implicitly consistent (already applied).
+		} else {
+			ourTerm := termAt(n.ps.Log, args.PrevLogIndex)
+			if ourTerm == 0 {
+				// We don't have the entry at PrevLogIndex.
+				reply.ConflictIndex = n.lastLogIndex() + 1
+				reply.ConflictTerm = 0
+				return reply
+			}
+			if ourTerm != args.PrevLogTerm {
+				// Term mismatch — send fast-rollback hint.
+				reply.ConflictTerm = ourTerm
+				reply.ConflictIndex = firstIndexOfTerm(n.ps.Log, ourTerm)
+				return reply
+			}
 		}
 	}
 
@@ -45,6 +57,9 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	// AppendEntries until the operator intervenes, which is far safer than
 	// silently losing log entries that later disappear on restart.
 	for _, entry := range args.Entries {
+		if entry.Index <= n.snapshot.LastIncludedIndex {
+			continue // already committed in snapshot
+		}
 		existing := termAt(n.ps.Log, entry.Index)
 		if existing != 0 {
 			if existing != entry.Term {
@@ -74,7 +89,7 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 	// Advance commit index.
 	if args.LeaderCommit > n.vs.CommitIndex {
-		li := lastIndex(n.ps.Log)
+		li := n.lastLogIndex()
 		if args.LeaderCommit < li {
 			n.vs.CommitIndex = args.LeaderCommit
 		} else {
@@ -97,7 +112,8 @@ func (n *Node) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 // RPC. Batching improves catchup throughput without unbounded payload sizes.
 const maxEntriesPerRPC = 64
 
-// replicateToPeer sends AppendEntries to a single peer. Runs in its own goroutine.
+// replicateToPeer sends AppendEntries (or InstallSnapshot) to a single peer.
+// Runs in its own goroutine.
 func (n *Node) replicateToPeer(peerID, peerAddr string) {
 	n.mu.Lock()
 	if n.role != Leader {
@@ -105,8 +121,46 @@ func (n *Node) replicateToPeer(peerID, peerAddr string) {
 		return
 	}
 	nextIdx := n.vs.NextIndex[peerID]
+
+	// If the peer has fallen behind the snapshot boundary, send the snapshot instead.
+	if nextIdx <= n.snapshot.LastIncludedIndex {
+		snap := n.snapshot
+		term := n.ps.CurrentTerm
+		n.mu.Unlock()
+
+		args := InstallSnapshotArgs{
+			Term:              term,
+			LeaderID:          n.id,
+			LastIncludedIndex: snap.LastIncludedIndex,
+			LastIncludedTerm:  snap.LastIncludedTerm,
+			Data:              snap.Data,
+		}
+		reply, err := sendInstallSnapshot(peerAddr, args)
+		if err != nil {
+			return
+		}
+
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if reply.Term > n.ps.CurrentTerm {
+			n.stepDown(reply.Term)
+			return
+		}
+		if n.role != Leader {
+			return
+		}
+		if reply.Success {
+			if snap.LastIncludedIndex > n.vs.MatchIndex[peerID] {
+				n.vs.MatchIndex[peerID] = snap.LastIncludedIndex
+			}
+			n.vs.NextIndex[peerID] = n.vs.MatchIndex[peerID] + 1
+		}
+		return
+	}
+
+	// Normal AppendEntries path.
 	prevIdx := nextIdx - 1
-	prevTerm := termAt(n.ps.Log, prevIdx)
+	prevTerm := n.termAtWithSnapshot(prevIdx)
 	rawEntries := logSlice(n.ps.Log, prevIdx)
 	if len(rawEntries) > maxEntriesPerRPC {
 		rawEntries = rawEntries[:maxEntriesPerRPC]
