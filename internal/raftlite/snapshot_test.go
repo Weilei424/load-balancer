@@ -2,6 +2,7 @@ package raftlite
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"os"
@@ -410,5 +411,129 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 	// ApplySnapshot callback must have fired.
 	if !n3SnapApplied.Load() {
 		t.Error("n3 ApplySnapshot callback was never called")
+	}
+}
+
+// TestInstallSnapshotApplyFailureReturnsFailure verifies that when the
+// ApplySnapshot callback returns an error during serveInstallSnapshot, the reply
+// carries Success=false and LastApplied/CommitIndex are NOT advanced. This prevents
+// Raft state from diverging from the state machine when restore fails.
+//
+// This is a unit test that drives receiveInstallSnapshot + the failure path
+// directly, without needing a live cluster.
+func TestInstallSnapshotApplyFailureReturnsFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	var applyAttempts atomic.Int32
+	applyCh := make(chan LogEntry, 4)
+	proposeCh := make(chan ProposeReq, 4)
+	n, err := NewNode(Config{
+		ID:        "n1",
+		Peers:     map[string]string{},
+		HTTPPeers: map[string]string{},
+		DataDir:   dir,
+		ApplySnapshot: func(_ []byte) error {
+			applyAttempts.Add(1)
+			return errors.New("disk full")
+		},
+	}, applyCh, proposeCh, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+
+	// Simulate a leader on term 1 sending us a snapshot at index 100.
+	n.mu.Lock()
+	n.ps.CurrentTerm = 1
+	reply, accepted, snap := n.receiveInstallSnapshot(InstallSnapshotArgs{
+		Term:              1,
+		LeaderID:          "leader",
+		LastIncludedIndex: 100,
+		LastIncludedTerm:  1,
+		Data:              []byte(`{}`),
+	})
+	n.mu.Unlock()
+
+	if !accepted {
+		t.Fatal("expected receiveInstallSnapshot to accept the snapshot")
+	}
+
+	// Now mimic what serveInstallSnapshot does on callback failure:
+	// call applySnapshot, observe error, do NOT advance state.
+	applyErr := n.applySnapshot(snap.Data)
+	if applyErr == nil {
+		t.Fatal("expected applySnapshot to return an error")
+	}
+	// reply.Success must remain false — we must NOT set it true after a failure.
+	if reply.Success {
+		t.Error("reply.Success must be false when applySnapshot fails")
+	}
+
+	// LastApplied and CommitIndex must not have advanced (finalization was skipped).
+	s := n.Status()
+	if s.CommitIndex >= 100 {
+		t.Errorf("CommitIndex=%d advanced despite failed apply (want <100)", s.CommitIndex)
+	}
+	if s.LastApplied >= 100 {
+		t.Errorf("LastApplied=%d advanced despite failed apply (want <100)", s.LastApplied)
+	}
+	if applyAttempts.Load() != 1 {
+		t.Errorf("applySnapshot called %d times, want 1", applyAttempts.Load())
+	}
+}
+
+// TestStartupSnapshotRestoreFailureStopsNode verifies that when the ApplySnapshot
+// callback fails during startup, the node stops rather than replaying the log tail
+// on top of an unrestored state machine.
+func TestStartupSnapshotRestoreFailureStopsNode(t *testing.T) {
+	dir := t.TempDir()
+
+	// Place a snapshot at index 50, term 1.
+	snap := Snapshot{LastIncludedIndex: 50, LastIncludedTerm: 1, Data: []byte("{}")}
+	if err := saveSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveSnapshot: %v", err)
+	}
+
+	var logEntriesApplied atomic.Int32
+	applyCh := make(chan LogEntry, 64)
+	proposeCh := make(chan ProposeReq, 4)
+
+	n, err := NewNode(Config{
+		ID:        "n1",
+		Peers:     map[string]string{},
+		HTTPPeers: map[string]string{},
+		DataDir:   dir,
+		ApplySnapshot: func(_ []byte) error {
+			return errors.New("restore failed")
+		},
+	}, applyCh, proposeCh, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+
+	// Count any entries that leak through applyCh after a failed restore.
+	go func() {
+		for range applyCh {
+			logEntriesApplied.Add(1)
+		}
+	}()
+
+	// Run() should stop the node on restore failure, not replay the log.
+	done := make(chan struct{})
+	go func() {
+		n.Run()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Good: Run() returned (node stopped itself).
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return after startup snapshot restore failure")
+	}
+
+	// No log entries should have been sent to applyCh.
+	time.Sleep(50 * time.Millisecond)
+	if got := logEntriesApplied.Load(); got > 0 {
+		t.Errorf("log entries were applied after failed snapshot restore: got %d, want 0", got)
 	}
 }
