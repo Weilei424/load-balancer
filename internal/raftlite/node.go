@@ -24,6 +24,12 @@ type Node struct {
 	role     Role
 	leaderID string
 
+	// snapshot is the current compacted snapshot (LastIncludedIndex=0 → none).
+	snapshot      Snapshot
+	snapThreshold int           // effective threshold; triggers auto-snapshot
+	snapApplyCh   chan Snapshot // delivers snapshots to SnapshotCh() consumers
+	snapshotter   func() []byte // serializes state machine; nil disables auto-snapshotting
+
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
 
@@ -52,6 +58,11 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 		return nil, fmt.Errorf("mkdir dataDir: %w", err)
 	}
 
+	snap, _, err := loadSnapshot(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("load snapshot: %w", err)
+	}
+
 	term, votedFor, err := loadMeta(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("load meta: %w", err)
@@ -60,13 +71,32 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 	if err != nil {
 		return nil, fmt.Errorf("load log: %w", err)
 	}
+	// Filter out any log entries already covered by the snapshot (defensive: clean
+	// shutdown always trims them, but a mid-snapshot crash might leave them).
+	if snap.LastIncludedIndex > 0 {
+		entries = logSlice(entries, snap.LastIncludedIndex)
+	}
+
 	commitIdx, err := loadCommit(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("load commit: %w", err)
 	}
-	// Clamp to the actual log length in case the log was truncated after the commit was persisted.
-	if commitIdx > lastIndex(entries) {
-		commitIdx = lastIndex(entries)
+	// commitIdx must be at least the snapshot boundary.
+	if commitIdx < snap.LastIncludedIndex {
+		commitIdx = snap.LastIncludedIndex
+	}
+	// Clamp to the actual log extent (log + snapshot boundary).
+	maxIdx := lastIndex(entries)
+	if maxIdx < snap.LastIncludedIndex {
+		maxIdx = snap.LastIncludedIndex
+	}
+	if commitIdx > maxIdx {
+		commitIdx = maxIdx
+	}
+
+	snapThreshold := cfg.SnapshotThreshold
+	if snapThreshold <= 0 {
+		snapThreshold = 1000
 	}
 
 	// Seed per-node RNG: mix wall-clock nanoseconds with a hash of the node ID so
@@ -79,10 +109,14 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 	rng := rand.New(rand.NewSource(seed))
 
 	n := &Node{
-		id:        cfg.ID,
-		dataDir:   cfg.DataDir,
-		peers:     cfg.Peers,
-		httpPeers: cfg.HTTPPeers,
+		id:            cfg.ID,
+		dataDir:       cfg.DataDir,
+		peers:         cfg.Peers,
+		httpPeers:     cfg.HTTPPeers,
+		snapshot:      snap,
+		snapThreshold: snapThreshold,
+		snapApplyCh:   make(chan Snapshot, 4),
+		snapshotter:   cfg.Snapshotter,
 		ps: PersistentState{
 			CurrentTerm: term,
 			VotedFor:    votedFor,
@@ -90,6 +124,7 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 		},
 		vs: VolatileState{
 			CommitIndex: commitIdx,
+			LastApplied: snap.LastIncludedIndex, // entries up to snapshot already applied
 			NextIndex:   make(map[string]int),
 			MatchIndex:  make(map[string]int),
 		},
@@ -114,6 +149,13 @@ func (n *Node) Run() {
 	n.withStateLocked(n.log.Info()).Msg("raft node starting")
 	n.mu.Unlock()
 	go n.runApplier()
+	// Deliver startup snapshot so the caller can restore state machine before log replay.
+	if n.snapshot.LastIncludedIndex > 0 {
+		select {
+		case n.snapApplyCh <- n.snapshot:
+		default:
+		}
+	}
 	// Replay any committed-but-not-yet-applied entries that survived restart.
 	n.signalApplier()
 
@@ -230,6 +272,120 @@ func (n *Node) withStateLocked(e *zerolog.Event) *zerolog.Event {
 	return e.Int("term", n.ps.CurrentTerm).Str("role", n.role.String()).Str("leader_id", n.leaderID)
 }
 
+// SnapshotCh returns a channel that delivers snapshots to apply to the state machine.
+// A startup snapshot (if any) is sent before log replay; InstallSnapshot RPCs also
+// deliver via this channel.
+func (n *Node) SnapshotCh() <-chan Snapshot { return n.snapApplyCh }
+
+// lastLogIndex returns the index of the last log entry, accounting for snapshots.
+// Called with n.mu held.
+func (n *Node) lastLogIndex() int {
+	li := lastIndex(n.ps.Log)
+	if li < n.snapshot.LastIncludedIndex {
+		return n.snapshot.LastIncludedIndex
+	}
+	return li
+}
+
+// lastLogTerm returns the term of the last log entry, accounting for snapshots.
+// Called with n.mu held.
+func (n *Node) lastLogTerm() int {
+	if len(n.ps.Log) == 0 {
+		return n.snapshot.LastIncludedTerm
+	}
+	return lastTerm(n.ps.Log)
+}
+
+// termAtWithSnapshot returns the term at idx, checking the snapshot boundary first.
+// Called with n.mu held.
+func (n *Node) termAtWithSnapshot(idx int) int {
+	if idx == n.snapshot.LastIncludedIndex {
+		return n.snapshot.LastIncludedTerm
+	}
+	return termAt(n.ps.Log, idx)
+}
+
+// TakeSnapshot compacts the log up to CommitIndex and saves a snapshot.
+// Safe to call from the applier goroutine (acquires n.mu internally).
+// Holds n.mu during disk writes to prevent concurrent log appends from racing
+// with the atomic log rewrite.
+func (n *Node) TakeSnapshot(data []byte) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	commitIdx := n.vs.CommitIndex
+	term := n.termAtWithSnapshot(commitIdx)
+	if term == 0 {
+		return fmt.Errorf("takeSnapshot: term unknown for index %d", commitIdx)
+	}
+	newLog := logSlice(n.ps.Log, commitIdx)
+	snap := Snapshot{LastIncludedIndex: commitIdx, LastIncludedTerm: term, Data: data}
+
+	if err := saveSnapshot(n.dataDir, snap); err != nil {
+		return err
+	}
+	if err := rewriteLogDisk(n.dataDir, newLog); err != nil {
+		return err
+	}
+	n.ps.Log = newLog
+	n.snapshot = snap
+	return nil
+}
+
+// handleInstallSnapshot processes an InstallSnapshot RPC from the leader.
+// Must be called with n.mu held.
+func (n *Node) handleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+	reply := InstallSnapshotReply{Term: n.ps.CurrentTerm}
+	if args.Term < n.ps.CurrentTerm {
+		return reply
+	}
+	if args.Term > n.ps.CurrentTerm {
+		n.stepDown(args.Term)
+	} else if n.role == Candidate {
+		n.role = Follower
+	}
+	n.leaderID = args.LeaderID
+	n.resetElectionTimer()
+	reply.Term = n.ps.CurrentTerm
+
+	if args.LastIncludedIndex <= n.snapshot.LastIncludedIndex {
+		reply.Success = true // already up-to-date
+		return reply
+	}
+
+	snap := Snapshot{
+		LastIncludedIndex: args.LastIncludedIndex,
+		LastIncludedTerm:  args.LastIncludedTerm,
+		Data:              args.Data,
+	}
+	newLog := logSlice(n.ps.Log, args.LastIncludedIndex)
+	if err := saveSnapshot(n.dataDir, snap); err != nil {
+		n.log.Error().Err(err).Msg("install-snapshot: save failed")
+		return reply
+	}
+	if err := rewriteLogDisk(n.dataDir, newLog); err != nil {
+		n.log.Error().Err(err).Msg("install-snapshot: rewrite log failed")
+		return reply
+	}
+	n.ps.Log = newLog
+	n.snapshot = snap
+	if n.vs.CommitIndex < args.LastIncludedIndex {
+		n.vs.CommitIndex = args.LastIncludedIndex
+		_ = saveCommit(n.dataDir, n.vs.CommitIndex)
+	}
+	if n.vs.LastApplied < args.LastIncludedIndex {
+		n.vs.LastApplied = args.LastIncludedIndex
+	}
+	reply.Success = true
+
+	// Deliver snapshot to the state machine consumer (non-blocking; 4-deep buffer).
+	select {
+	case n.snapApplyCh <- snap:
+	default:
+	}
+	return reply
+}
+
 // ---- Internal methods ----
 
 // startElection starts a new election. Called with n.mu held.
@@ -245,8 +401,8 @@ func (n *Node) startElection() {
 	args := RequestVoteArgs{
 		Term:         term,
 		CandidateID:  n.id,
-		LastLogIndex: lastIndex(n.ps.Log),
-		LastLogTerm:  lastTerm(n.ps.Log),
+		LastLogIndex: n.lastLogIndex(),
+		LastLogTerm:  n.lastLogTerm(),
 	}
 	total := 1 + len(n.peers)
 	votes := 1 // voted for self
@@ -287,7 +443,7 @@ func (n *Node) startElection() {
 func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.leaderID = n.id
-	li := lastIndex(n.ps.Log)
+	li := n.lastLogIndex()
 	for id := range n.peers {
 		n.vs.NextIndex[id] = li + 1
 		n.vs.MatchIndex[id] = 0
@@ -350,7 +506,7 @@ func (n *Node) appendProposal(cmd json.RawMessage) error {
 		return fmt.Errorf("not leader (leader=%s)", n.leaderID)
 	}
 	entry := LogEntry{
-		Index:   lastIndex(n.ps.Log) + 1,
+		Index:   n.lastLogIndex() + 1,
 		Term:    n.ps.CurrentTerm,
 		Command: cmd,
 	}
@@ -396,11 +552,20 @@ func (n *Node) runApplier() {
 }
 
 // applyCommitted sends newly committed entries to applyCh, in index order.
+// After all pending entries are applied, triggers an auto-snapshot if the log
+// has grown past the threshold.
 func (n *Node) applyCommitted() {
 	for {
 		n.mu.Lock()
 		if n.vs.LastApplied >= n.vs.CommitIndex {
+			shouldSnap := n.snapshotter != nil && len(n.ps.Log) > n.snapThreshold
 			n.mu.Unlock()
+			if shouldSnap {
+				data := n.snapshotter()
+				if err := n.TakeSnapshot(data); err != nil {
+					n.log.Error().Err(err).Msg("auto-snapshot failed")
+				}
+			}
 			return
 		}
 		n.vs.LastApplied++
