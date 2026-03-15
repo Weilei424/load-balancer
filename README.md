@@ -74,8 +74,8 @@ Detailed runbooks live in:
 **Follower redirect vs. forward**
 Admin write requests land on a follower are answered with an HTTP 307 redirect pointing to the current leader. The alternative — having the follower transparently forward the request body to the leader — was not chosen because it would require buffering a potentially large request body, duplicating the response, and handling mid-stream errors. A redirect keeps follower logic minimal and lets the client own the retry.
 
-**No snapshot / log compaction in v1**
-The Raft log grows without bound. On restart, replay is proportional to log length. Snapshotting (§7 of the Raft paper) is the natural next feature but was deferred to keep the scope reasonable for a learning project.
+**Snapshot compaction threshold**
+The Raft log is compacted once it exceeds 1000 entries (configurable via `Config.SnapshotThreshold`). The snapshot is written atomically to `snapshot.json` via a tmp→rename, and the log tail is rewritten to contain only entries after the snapshot boundary. The `ApplySnapshot` callback is called synchronously before any log replay on restart, so the state machine is always restored before new entries are applied. Snapshot transfer to lagging followers uses the `POST /raft/install-snapshot` RPC; `LastApplied`/`CommitIndex` are not advanced until the restore callback returns without error.
 
 **Weighted round-robin implementation**
 Routing uses Nginx's smooth weighted round-robin (SWRR) rather than expanding each backend into `weight` virtual slots. SWRR uses O(n) memory regardless of total weight and produces a well-interleaved sequence with no bursts, while the slot-expansion approach uses O(Σweight) memory and can produce runs of the same backend.
@@ -91,13 +91,13 @@ The proxy returns 503 until at least one backend is committed through the Raft l
 Implemented:
 - leader election with randomized election timeouts
 - heartbeat-based liveness detection
-- minimal log replication with majority commit
-- persistence of term, vote, and log
+- log replication with majority commit and batched AppendEntries (up to 64 entries/RPC)
+- log snapshot and compaction with InstallSnapshot RPC for lagging followers
+- persistence of term, vote, log, commit index, and snapshot
 - backend health checks
 - local demo and chaos workflows
 
-Not implemented in v1:
-- snapshots / log compaction
+Not implemented:
 - dynamic membership / joint consensus
 - TLS or auth
 - production packaging or orchestration
