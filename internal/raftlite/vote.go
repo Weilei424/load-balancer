@@ -22,8 +22,10 @@ func (n *Node) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	}
 
 	// Candidate log must be at least as up-to-date as ours (Raft §5.4.1).
-	ourLastIndex := lastIndex(n.ps.Log)
-	ourLastTerm := lastTerm(n.ps.Log)
+	// Use snapshot-aware helpers: after compaction the tail may be empty but
+	// the snapshot boundary is the true "last entry" for freshness comparison.
+	ourLastIndex := n.lastLogIndex()
+	ourLastTerm := n.lastLogTerm()
 	logOK := args.LastLogTerm > ourLastTerm ||
 		(args.LastLogTerm == ourLastTerm && args.LastLogIndex >= ourLastIndex)
 	if !logOK {
