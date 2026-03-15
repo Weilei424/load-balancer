@@ -12,6 +12,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("/raft/vote", n.serveVote)
 	mux.HandleFunc("/raft/append", n.serveAppend)
 	mux.HandleFunc("/raft/status", n.serveStatus)
+	mux.HandleFunc("/raft/install-snapshot", n.serveInstallSnapshot)
 	return mux
 }
 
@@ -53,4 +54,21 @@ func (n *Node) serveStatus(w http.ResponseWriter, r *http.Request) {
 	s := n.Status()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(s) //nolint:errcheck
+}
+
+func (n *Node) serveInstallSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var args InstallSnapshotArgs
+	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	n.mu.Lock()
+	reply := n.handleInstallSnapshot(args)
+	n.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(reply) //nolint:errcheck
 }
