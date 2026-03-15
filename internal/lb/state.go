@@ -1,6 +1,10 @@
 package lb
 
-import "sync"
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+)
 
 // Algorithm names for routing selection.
 const (
@@ -144,4 +148,53 @@ func removeBackend(backends []*Backend, url string) []*Backend {
 		}
 	}
 	return out
+}
+
+type configSnapshotData struct {
+	Backends  []backendSnapshotEntry `json:"backends"`
+	Algorithm string                 `json:"algorithm"`
+}
+
+type backendSnapshotEntry struct {
+	URL     string `json:"url"`
+	Weight  int    `json:"weight"`
+	Healthy bool   `json:"healthy"`
+}
+
+// SnapshotData serialises the current config state into a JSON byte slice.
+func (cs *ConfigState) SnapshotData() []byte {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	snap := configSnapshotData{Algorithm: cs.algorithm}
+	for _, b := range cs.backends {
+		snap.Backends = append(snap.Backends, backendSnapshotEntry{
+			URL:     b.URL,
+			Weight:  b.Weight,
+			Healthy: b.Healthy,
+		})
+	}
+	data, _ := json.Marshal(snap)
+	return data
+}
+
+// RestoreSnapshot replaces the current config state with the contents of data.
+func (cs *ConfigState) RestoreSnapshot(data []byte) error {
+	var snap configSnapshotData
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return fmt.Errorf("restore snapshot: %w", err)
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.backends = cs.backends[:0]
+	for _, b := range snap.Backends {
+		cs.backends = append(cs.backends, &Backend{
+			URL:     b.URL,
+			Weight:  b.Weight,
+			Healthy: b.Healthy,
+		})
+	}
+	if snap.Algorithm != "" {
+		cs.algorithm = snap.Algorithm
+	}
+	return nil
 }
