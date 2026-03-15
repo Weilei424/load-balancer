@@ -77,9 +77,13 @@ func (n *Node) serveInstallSnapshot(w http.ResponseWriter, r *http.Request) {
 		// so no subsequent log entry can be applied to a stale state machine.
 		if n.applySnapshot != nil {
 			if err := n.applySnapshot(snap.Data); err != nil {
-				n.log.Error().Err(err).Msg("install-snapshot: apply callback failed")
-				// Snapshot is already on disk; log the error and continue — the
-				// leader will retry if the state machine stays inconsistent.
+				// Restore failed: return Success=false so the leader retries.
+				// Do NOT advance LastApplied/CommitIndex — Raft state and the
+				// state machine would diverge if we claimed success here.
+				n.log.Error().Err(err).Msg("install-snapshot: apply callback failed; returning failure to leader")
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(reply) //nolint:errcheck
+				return
 			}
 		}
 		// Finalize volatile state now that restore has completed.
