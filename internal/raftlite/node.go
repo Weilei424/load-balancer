@@ -27,8 +27,8 @@ type Node struct {
 	// snapshot is the current compacted snapshot (LastIncludedIndex=0 → none).
 	snapshot      Snapshot
 	snapThreshold int           // effective threshold; triggers auto-snapshot
-	snapApplyCh   chan Snapshot // delivers snapshots to SnapshotCh() consumers
 	snapshotter   func() []byte // serializes state machine; nil disables auto-snapshotting
+	applySnapshot func([]byte) error // restores state machine; called synchronously, no lock held
 
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
@@ -115,8 +115,8 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 		httpPeers:     cfg.HTTPPeers,
 		snapshot:      snap,
 		snapThreshold: snapThreshold,
-		snapApplyCh:   make(chan Snapshot, 4),
 		snapshotter:   cfg.Snapshotter,
+		applySnapshot: cfg.ApplySnapshot,
 		ps: PersistentState{
 			CurrentTerm: term,
 			VotedFor:    votedFor,
@@ -148,14 +148,14 @@ func (n *Node) Run() {
 	n.mu.Lock()
 	n.withStateLocked(n.log.Info()).Msg("raft node starting")
 	n.mu.Unlock()
-	go n.runApplier()
-	// Deliver startup snapshot so the caller can restore state machine before log replay.
-	if n.snapshot.LastIncludedIndex > 0 {
-		select {
-		case n.snapApplyCh <- n.snapshot:
-		default:
+	// Apply the startup snapshot synchronously, before the applier goroutine starts,
+	// so the state machine is fully restored before any log-tail entries are replayed.
+	if n.snapshot.LastIncludedIndex > 0 && n.applySnapshot != nil {
+		if err := n.applySnapshot(n.snapshot.Data); err != nil {
+			n.log.Error().Err(err).Msg("startup snapshot apply failed")
 		}
 	}
+	go n.runApplier()
 	// Replay any committed-but-not-yet-applied entries that survived restart.
 	n.signalApplier()
 
@@ -272,11 +272,6 @@ func (n *Node) withStateLocked(e *zerolog.Event) *zerolog.Event {
 	return e.Int("term", n.ps.CurrentTerm).Str("role", n.role.String()).Str("leader_id", n.leaderID)
 }
 
-// SnapshotCh returns a channel that delivers snapshots to apply to the state machine.
-// A startup snapshot (if any) is sent before log replay; InstallSnapshot RPCs also
-// deliver via this channel.
-func (n *Node) SnapshotCh() <-chan Snapshot { return n.snapApplyCh }
-
 // lastLogIndex returns the index of the last log entry, accounting for snapshots.
 // Called with n.mu held.
 func (n *Node) lastLogIndex() int {
@@ -332,12 +327,19 @@ func (n *Node) TakeSnapshot(data []byte) error {
 	return nil
 }
 
-// handleInstallSnapshot processes an InstallSnapshot RPC from the leader.
+// receiveInstallSnapshot validates the snapshot RPC, writes it to disk, and updates
+// in-memory log state. It does NOT advance LastApplied/CommitIndex — the caller
+// (serveInstallSnapshot) does that after the state machine callback returns.
+//
+// Returns (reply, accepted, snap):
+//   - accepted=false: reply is already final (stale term or already current).
+//   - accepted=true:  caller should invoke applySnapshot(snap.Data) then finalize.
+//
 // Must be called with n.mu held.
-func (n *Node) handleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+func (n *Node) receiveInstallSnapshot(args InstallSnapshotArgs) (InstallSnapshotReply, bool, Snapshot) {
 	reply := InstallSnapshotReply{Term: n.ps.CurrentTerm}
 	if args.Term < n.ps.CurrentTerm {
-		return reply
+		return reply, false, Snapshot{}
 	}
 	if args.Term > n.ps.CurrentTerm {
 		n.stepDown(args.Term)
@@ -349,8 +351,8 @@ func (n *Node) handleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	reply.Term = n.ps.CurrentTerm
 
 	if args.LastIncludedIndex <= n.snapshot.LastIncludedIndex {
-		reply.Success = true // already up-to-date
-		return reply
+		reply.Success = true // already up-to-date; nothing to apply
+		return reply, false, Snapshot{}
 	}
 
 	snap := Snapshot{
@@ -361,29 +363,17 @@ func (n *Node) handleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	newLog := logSlice(n.ps.Log, args.LastIncludedIndex)
 	if err := saveSnapshot(n.dataDir, snap); err != nil {
 		n.log.Error().Err(err).Msg("install-snapshot: save failed")
-		return reply
+		return reply, false, Snapshot{}
 	}
 	if err := rewriteLogDisk(n.dataDir, newLog); err != nil {
 		n.log.Error().Err(err).Msg("install-snapshot: rewrite log failed")
-		return reply
+		return reply, false, Snapshot{}
 	}
 	n.ps.Log = newLog
 	n.snapshot = snap
-	if n.vs.CommitIndex < args.LastIncludedIndex {
-		n.vs.CommitIndex = args.LastIncludedIndex
-		_ = saveCommit(n.dataDir, n.vs.CommitIndex)
-	}
-	if n.vs.LastApplied < args.LastIncludedIndex {
-		n.vs.LastApplied = args.LastIncludedIndex
-	}
-	reply.Success = true
-
-	// Deliver snapshot to the state machine consumer (non-blocking; 4-deep buffer).
-	select {
-	case n.snapApplyCh <- snap:
-	default:
-	}
-	return reply
+	// LastApplied/CommitIndex are NOT updated here; they are set after
+	// the state machine callback confirms the restore completed.
+	return reply, true, snap
 }
 
 // ---- Internal methods ----

@@ -83,6 +83,10 @@ type Config struct {
 	Snapshotter func() []byte
 	// SnapshotThreshold triggers a snapshot when len(log) exceeds this value. Default: 1000.
 	SnapshotThreshold int
+	// ApplySnapshot is called synchronously (without n.mu held) to restore the state
+	// machine from a snapshot. Called before log replay on startup and before
+	// LastApplied advances on InstallSnapshot. Nil means no external state machine.
+	ApplySnapshot func(data []byte) error
 }
 
 // RequestVoteArgs is the argument struct for RequestVote RPC.

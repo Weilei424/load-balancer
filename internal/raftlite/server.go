@@ -66,9 +66,36 @@ func (n *Node) serveInstallSnapshot(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+
 	n.mu.Lock()
-	reply := n.handleInstallSnapshot(args)
+	reply, accepted, snap := n.receiveInstallSnapshot(args)
 	n.mu.Unlock()
+
+	if accepted {
+		// Apply snapshot to state machine synchronously without holding n.mu.
+		// This guarantees the state machine is restored before LastApplied advances,
+		// so no subsequent log entry can be applied to a stale state machine.
+		if n.applySnapshot != nil {
+			if err := n.applySnapshot(snap.Data); err != nil {
+				n.log.Error().Err(err).Msg("install-snapshot: apply callback failed")
+				// Snapshot is already on disk; log the error and continue — the
+				// leader will retry if the state machine stays inconsistent.
+			}
+		}
+		// Finalize volatile state now that restore has completed.
+		n.mu.Lock()
+		if n.vs.CommitIndex < snap.LastIncludedIndex {
+			n.vs.CommitIndex = snap.LastIncludedIndex
+			_ = saveCommit(n.dataDir, n.vs.CommitIndex)
+		}
+		if n.vs.LastApplied < snap.LastIncludedIndex {
+			n.vs.LastApplied = snap.LastIncludedIndex
+		}
+		reply.Success = true
+		reply.Term = n.ps.CurrentTerm
+		n.mu.Unlock()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(reply) //nolint:errcheck
 }
