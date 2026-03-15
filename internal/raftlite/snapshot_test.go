@@ -6,14 +6,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
-// startClusterNodeWithConfig creates a clusterNode using the given Config, reusing
-// a caller-supplied DataDir (needed for restart tests).
+// startClusterNodeWithConfig creates a clusterNode using the given Config, binding
+// to the supplied listener. The caller must provide a Config with DataDir already
+// set (needed for restart tests). applyCh is drained by a background goroutine so
+// the node never stalls; if the caller needs to observe entries, pass a separate
+// channel and bridge it in cfg.ApplySnapshot.
 func startClusterNodeWithConfig(t *testing.T, cfg Config, ln net.Listener) *clusterNode {
 	t.Helper()
 	applyCh := make(chan LogEntry, 256)
@@ -25,7 +29,7 @@ func startClusterNodeWithConfig(t *testing.T, cfg Config, ln net.Listener) *clus
 	srv := &http.Server{Handler: n.Handler()}
 	go srv.Serve(ln) //nolint:errcheck
 	go n.Run()
-	// Drain applyCh so the node doesn't stall.
+	// Drain applyCh so the node never stalls on a slow consumer.
 	go func() {
 		for range applyCh {
 		}
@@ -33,16 +37,108 @@ func startClusterNodeWithConfig(t *testing.T, cfg Config, ln net.Listener) *clus
 	return &clusterNode{Node: n, ln: ln, srv: srv}
 }
 
+// TestVoteFreshnessAfterCompaction verifies that a node with a compacted snapshot
+// correctly rejects votes from candidates whose log is less up-to-date than the
+// snapshot boundary, and grants votes to candidates at or beyond the boundary.
+//
+// This is a regression test for the bug where handleRequestVote used
+// lastIndex(ps.Log)/lastTerm(ps.Log) instead of the snapshot-aware helpers,
+// causing a node with an empty tail (lastIndex=0, lastTerm=0) to grant votes to
+// any candidate — even stale ones.
+func TestVoteFreshnessAfterCompaction(t *testing.T) {
+	dir := t.TempDir()
+
+	// Place a snapshot at index 100, term 3 on disk.
+	snap := Snapshot{LastIncludedIndex: 100, LastIncludedTerm: 3, Data: []byte("{}")}
+	if err := saveSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveSnapshot: %v", err)
+	}
+
+	applyCh := make(chan LogEntry, 4)
+	proposeCh := make(chan ProposeReq, 4)
+	n, err := NewNode(Config{
+		ID:        "n1",
+		Peers:     map[string]string{},
+		HTTPPeers: map[string]string{},
+		DataDir:   dir,
+	}, applyCh, proposeCh, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Verify the snapshot was loaded (lastLogIndex should reflect it).
+	if got := n.lastLogIndex(); got != 100 {
+		t.Fatalf("lastLogIndex() = %d, want 100 (snapshot boundary)", got)
+	}
+	if got := n.lastLogTerm(); got != 3 {
+		t.Fatalf("lastLogTerm() = %d, want 3", got)
+	}
+
+	// Set current term to match snapshot term.
+	n.ps.CurrentTerm = 3
+
+	// Case 1: candidate with stale log (index=50, term=2) — must be rejected.
+	n.ps.VotedFor = ""
+	reply := n.handleRequestVote(RequestVoteArgs{
+		Term:         3,
+		CandidateID:  "stale",
+		LastLogIndex: 50,
+		LastLogTerm:  2,
+	})
+	if reply.VoteGranted {
+		t.Error("stale candidate (index=50, term=2): expected vote DENIED, got GRANTED")
+	}
+
+	// Case 2: candidate at exact snapshot boundary (index=100, term=3) — must be granted.
+	n.ps.VotedFor = ""
+	reply = n.handleRequestVote(RequestVoteArgs{
+		Term:         3,
+		CandidateID:  "boundary",
+		LastLogIndex: 100,
+		LastLogTerm:  3,
+	})
+	if !reply.VoteGranted {
+		t.Error("boundary candidate (index=100, term=3): expected vote GRANTED, got DENIED")
+	}
+
+	// Case 3: candidate beyond the boundary (index=150, term=3) — must be granted.
+	n.ps.VotedFor = ""
+	reply = n.handleRequestVote(RequestVoteArgs{
+		Term:         3,
+		CandidateID:  "ahead",
+		LastLogIndex: 150,
+		LastLogTerm:  3,
+	})
+	if !reply.VoteGranted {
+		t.Error("ahead candidate (index=150, term=3): expected vote GRANTED, got DENIED")
+	}
+
+	// Case 4: same index but lower term (index=100, term=2) — must be rejected.
+	n.ps.VotedFor = ""
+	reply = n.handleRequestVote(RequestVoteArgs{
+		Term:         3,
+		CandidateID:  "sameIdx",
+		LastLogIndex: 100,
+		LastLogTerm:  2,
+	})
+	if reply.VoteGranted {
+		t.Error("same-index lower-term candidate (index=100, term=2): expected vote DENIED, got GRANTED")
+	}
+}
+
 // TestSnapshotAndRestore verifies that:
-//  1. After proposing many entries, auto-snapshot compacts the log.
-//  2. On restart, the snapshot is delivered via SnapshotCh before log replay.
-//  3. CommitIndex and LastApplied are correctly restored.
+//  1. After proposing many entries the leader auto-snapshots and compacts its log.
+//  2. On restart the ApplySnapshot callback fires BEFORE any tail log entry is
+//     replayed — enforcing the ordering guarantee.
+//  3. CommitIndex/LastApplied are correctly restored from the snapshot.
 func TestSnapshotAndRestore(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	// Allocate two listeners so we know the addresses before creating nodes.
 	ln1, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen n1: %v", err)
@@ -51,10 +147,8 @@ func TestSnapshotAndRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen n2: %v", err)
 	}
-
 	addr1 := "http://" + ln1.Addr().String()
 	addr2 := "http://" + ln2.Addr().String()
-
 	dataDir1 := t.TempDir()
 
 	cfg1 := Config{
@@ -63,6 +157,7 @@ func TestSnapshotAndRestore(t *testing.T) {
 		HTTPPeers:         map[string]string{},
 		DataDir:           dataDir1,
 		Snapshotter:       func() []byte { return []byte(`{"state":"snap"}`) },
+		ApplySnapshot:     func(_ []byte) error { return nil },
 		SnapshotThreshold: 100,
 	}
 	cfg2 := Config{
@@ -71,6 +166,7 @@ func TestSnapshotAndRestore(t *testing.T) {
 		HTTPPeers:         map[string]string{},
 		DataDir:           t.TempDir(),
 		Snapshotter:       func() []byte { return []byte(`{"state":"snap"}`) },
+		ApplySnapshot:     func(_ []byte) error { return nil },
 		SnapshotThreshold: 100,
 	}
 
@@ -78,12 +174,10 @@ func TestSnapshotAndRestore(t *testing.T) {
 	n2 := startClusterNodeWithConfig(t, cfg2, ln2)
 	defer n2.Stop()
 
-	// Wait for a leader.
-	nodes := []*clusterNode{n1, n2}
-	leader := waitForLeader(t, nodes, 3*time.Second)
+	leader := waitForLeader(t, []*clusterNode{n1, n2}, 3*time.Second)
 	t.Logf("leader: %s", leader.Status().ID)
 
-	// Propose 200 entries.
+	// Propose 200 entries to trigger auto-snapshot (threshold=100).
 	cmd, _ := json.Marshal(map[string]string{"op": "test"})
 	for i := 0; i < 200; i++ {
 		if err := leader.Propose(cmd); err != nil {
@@ -91,7 +185,7 @@ func TestSnapshotAndRestore(t *testing.T) {
 		}
 	}
 
-	// Wait for the leader's log to be compacted (LogLength ≤ 100).
+	// Wait for leader log compaction.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		s := leader.Status()
@@ -108,81 +202,85 @@ func TestSnapshotAndRestore(t *testing.T) {
 		t.Fatalf("log not compacted: LogLength=%d (want ≤100)", ls.LogLength)
 	}
 
-	// snapshot.json must exist in the leader's dataDir.
-	leaderDataDir := dataDir1
+	// Only test the restart-ordering guarantee when n1 is the leader (it has the
+	// known dataDir). Skip otherwise — the compaction check above already passed.
 	if leader.id != "n1" {
-		// n2 is leader; we care about n1 restart test, so skip the restart part.
-		t.Skip("n2 became leader; skipping n1-restart sub-test")
-	}
-	if _, err := os.Stat(filepath.Join(leaderDataDir, "snapshot.json")); err != nil {
-		t.Fatalf("snapshot.json missing on leader: %v", err)
+		t.Skip("n2 became leader; restart ordering verified only for n1")
 	}
 
-	// Stop n1 (leader). n2 will be leaderless but we're done with proposals.
+	if _, err := os.Stat(filepath.Join(dataDir1, "snapshot.json")); err != nil {
+		t.Fatalf("snapshot.json missing on n1: %v", err)
+	}
+
 	n1.Stop()
 
-	// Restart n1 with same dataDir.
-	ln1r, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen restart: %v", err)
-	}
-	addr1r := "http://" + ln1r.Addr().String()
+	// Restart n1 with the same dataDir. Track ordering: applySnapshot must fire
+	// before any entry from applyCh is consumed.
+	var snapshotApplied atomic.Bool
+	var orderingViolation atomic.Bool
 
-	// Update n2's peers to point to the new address (for a real cluster we'd need
-	// dynamic membership; here we just verify n1 restores state from snapshot).
-	_ = addr1r // n2 peer update not needed for the restore check
-
-	// Create fresh applyCh/proposeCh for restarted n1.
 	applyCh := make(chan LogEntry, 256)
 	proposeCh := make(chan ProposeReq, 8)
 	n1r, err := NewNode(Config{
-		ID:                "n1",
-		Peers:             map[string]string{"n2": addr2},
-		HTTPPeers:         map[string]string{},
-		DataDir:           dataDir1,
-		Snapshotter:       func() []byte { return []byte(`{"state":"snap"}`) },
+		ID:        "n1",
+		Peers:     map[string]string{"n2": addr2},
+		HTTPPeers: map[string]string{},
+		DataDir:   dataDir1,
+		Snapshotter: func() []byte { return []byte(`{"state":"snap"}`) },
+		ApplySnapshot: func(_ []byte) error {
+			snapshotApplied.Store(true)
+			return nil
+		},
 		SnapshotThreshold: 100,
 	}, applyCh, proposeCh, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("restart NewNode: %v", err)
 	}
 
-	// Collect the startup snapshot from SnapshotCh before calling Run.
-	snapCh := n1r.SnapshotCh()
+	// Consume entries from applyCh in background, checking ordering.
+	go func() {
+		for range applyCh {
+			if !snapshotApplied.Load() {
+				orderingViolation.Store(true)
+			}
+		}
+	}()
 
+	ln1r, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen restart: %v", err)
+	}
 	srv1r := &http.Server{Handler: n1r.Handler()}
 	go srv1r.Serve(ln1r) //nolint:errcheck
 	go n1r.Run()
-	go func() { for range applyCh {} }()
 	defer func() {
 		n1r.Stop()
 		srv1r.Close()
 		ln1r.Close()
 	}()
 
-	// Drain SnapshotCh — should receive the startup snapshot quickly.
-	var gotSnap Snapshot
-	select {
-	case gotSnap = <-snapCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for startup snapshot on restart")
-	}
-	if gotSnap.LastIncludedIndex == 0 {
-		t.Fatal("startup snapshot has LastIncludedIndex=0")
+	// Give the node time to replay any tail entries.
+	time.Sleep(200 * time.Millisecond)
+
+	if orderingViolation.Load() {
+		t.Error("ordering violation: a log entry was applied before the snapshot was restored")
 	}
 
-	// Verify restored state.
 	s := n1r.Status()
-	if s.CommitIndex < gotSnap.LastIncludedIndex {
-		t.Fatalf("restart commitIndex=%d < snapshot.LastIncludedIndex=%d",
-			s.CommitIndex, gotSnap.LastIncludedIndex)
+	snap, _, err := loadSnapshot(dataDir1)
+	if err != nil {
+		t.Fatalf("loadSnapshot: %v", err)
 	}
-	if s.LastApplied < gotSnap.LastIncludedIndex {
-		t.Fatalf("restart lastApplied=%d < snapshot.LastIncludedIndex=%d",
-			s.LastApplied, gotSnap.LastIncludedIndex)
+	if s.CommitIndex < snap.LastIncludedIndex {
+		t.Errorf("restart commitIndex=%d < snapshot.LastIncludedIndex=%d",
+			s.CommitIndex, snap.LastIncludedIndex)
+	}
+	if s.LastApplied < snap.LastIncludedIndex {
+		t.Errorf("restart lastApplied=%d < snapshot.LastIncludedIndex=%d",
+			s.LastApplied, snap.LastIncludedIndex)
 	}
 	t.Logf("restart: commitIndex=%d lastApplied=%d snapshotAt=%d logLen=%d",
-		s.CommitIndex, s.LastApplied, gotSnap.LastIncludedIndex, s.LogLength)
+		s.CommitIndex, s.LastApplied, snap.LastIncludedIndex, s.LogLength)
 }
 
 // TestLaggingFollowerGetsSnapshot verifies that a follower whose nextIndex falls
@@ -193,8 +291,7 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	// Allocate listeners for 3 nodes: n1, n2, n3.
-	// n1 and n2 start immediately; n3 starts later with an empty dataDir.
+	// Allocate listeners for 3 nodes. n1 and n2 start immediately; n3 starts later.
 	lns := make([]net.Listener, 3)
 	for i := range lns {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -210,8 +307,10 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 	}
 
 	snapshotter := func() []byte { return []byte(`{"backends":[],"algorithm":"round_robin"}`) }
+	applyFn := func(_ []byte) error { return nil }
 
-	// Start n1 and n2 only. n3 is configured in peers but not yet running.
+	// Start n1 and n2 with n3 in their peer lists but not yet running.
+	// Two out of three is a majority so proposals can commit.
 	var cn12 []*clusterNode
 	for i := 0; i < 2; i++ {
 		id := ids[i]
@@ -227,6 +326,7 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 			HTTPPeers:         map[string]string{},
 			DataDir:           t.TempDir(),
 			Snapshotter:       snapshotter,
+			ApplySnapshot:     applyFn,
 			SnapshotThreshold: 50,
 		}
 		cn := startClusterNodeWithConfig(t, cfg, lns[i])
@@ -238,11 +338,10 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 		}
 	}()
 
-	// Wait for a leader among n1+n2 (majority of 3 requires 2, achievable).
 	leader := waitForLeader(t, cn12, 3*time.Second)
 	t.Logf("leader: %s", leader.Status().ID)
 
-	// Propose 200 entries (threshold=50 → snapshot(s) taken).
+	// Propose 200 entries (threshold=50 → multiple snapshots).
 	cmd, _ := json.Marshal(map[string]string{"op": "test"})
 	for i := 0; i < 200; i++ {
 		if err := leader.Propose(cmd); err != nil {
@@ -265,7 +364,9 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 	}
 	t.Logf("leader: commitIndex=%d logLen=%d", ls.CommitIndex, ls.LogLength)
 
-	// Start n3 with fresh dataDir.
+	// Start n3 with a fresh dataDir; its nextIndex on the leader will be 1,
+	// which is below the snapshot boundary → leader sends InstallSnapshot.
+	var n3SnapApplied atomic.Bool
 	n3DataDir := t.TempDir()
 	n3Peers := make(map[string]string)
 	for pid, pa := range addrs {
@@ -274,29 +375,24 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 		}
 	}
 	n3cfg := Config{
-		ID:                "n3",
-		Peers:             n3Peers,
-		HTTPPeers:         map[string]string{},
-		DataDir:           n3DataDir,
+		ID:        "n3",
+		Peers:     n3Peers,
+		HTTPPeers: map[string]string{},
+		DataDir:   n3DataDir,
+		ApplySnapshot: func(_ []byte) error {
+			n3SnapApplied.Store(true)
+			return nil
+		},
 		Snapshotter:       snapshotter,
 		SnapshotThreshold: 50,
 	}
 	n3 := startClusterNodeWithConfig(t, n3cfg, lns[2])
 	defer n3.Stop()
 
-	// Drain n3's SnapshotCh so it can process snapshots.
-	var snapReceived bool
-	go func() {
-		for range n3.SnapshotCh() {
-			snapReceived = true
-		}
-	}()
-
-	// Wait for n3 to catch up (commitIndex ≥ 200).
+	// Wait for n3 to catch up.
 	deadline = time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		s := n3.Status()
-		if s.CommitIndex >= 200 {
+		if n3.Status().CommitIndex >= 200 {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -307,9 +403,12 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 	}
 	t.Logf("n3: commitIndex=%d lastApplied=%d logLen=%d", n3s.CommitIndex, n3s.LastApplied, n3s.LogLength)
 
-	// n3 must have received a snapshot (snapshot.json exists in its dataDir).
+	// n3 must have received a snapshot (file on disk is authoritative).
 	if _, err := os.Stat(filepath.Join(n3DataDir, "snapshot.json")); err != nil {
 		t.Fatalf("n3 snapshot.json missing: %v", err)
 	}
-	_ = snapReceived // may or may not be set by the time we check due to race; file check is authoritative
+	// ApplySnapshot callback must have fired.
+	if !n3SnapApplied.Load() {
+		t.Error("n3 ApplySnapshot callback was never called")
+	}
 }
