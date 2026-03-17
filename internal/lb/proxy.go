@@ -52,7 +52,6 @@ func (p *Proxy) getProxy(rawURL string) *httputil.ReverseProxy {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
 	tracker := &responseWriterTracker{ResponseWriter: w}
 	var lastBackend *Backend
 
@@ -65,6 +64,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		lastBackend = backend
 
+		start := time.Now() // per-backend: measures time-to-first-byte for this attempt only
 		atomic.AddInt64(&backend.ConnCount, 1)
 		p.metrics.IncRequest(backend.URL)
 		p.getProxy(backend.URL).ServeHTTP(tracker, r)
@@ -73,7 +73,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if tracker.started {
 			// Response bytes reached the client — either success or an
 			// unrecoverable mid-stream error. Either way we are done.
-			p.metrics.ObserveLatency(backend.URL, time.Since(start))
+			p.metrics.ObserveLatency(backend.URL, tracker.firstByte.Sub(start))
 			return
 		}
 
@@ -113,18 +113,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // response bytes have been sent to the client. The proxy retry loop uses
 // tracker.started to decide if a backend failure is recoverable: if no bytes
 // have reached the client yet, we can switch to a different backend and retry.
+// firstByte records the wall-clock time of the first WriteHeader or Write call,
+// used to compute time-to-first-byte latency.
 type responseWriterTracker struct {
 	http.ResponseWriter
-	started bool
+	started   bool
+	firstByte time.Time
 }
 
 func (t *responseWriterTracker) WriteHeader(code int) {
-	t.started = true
+	if !t.started {
+		t.firstByte = time.Now()
+		t.started = true
+	}
 	t.ResponseWriter.WriteHeader(code)
 }
 
 func (t *responseWriterTracker) Write(b []byte) (int, error) {
-	t.started = true
+	if !t.started {
+		t.firstByte = time.Now()
+		t.started = true
+	}
 	return t.ResponseWriter.Write(b)
 }
 
