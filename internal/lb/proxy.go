@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -51,6 +52,7 @@ func (p *Proxy) getProxy(rawURL string) *httputil.ReverseProxy {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	tracker := &responseWriterTracker{ResponseWriter: w}
 	var lastBackend *Backend
 
@@ -71,6 +73,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if tracker.started {
 			// Response bytes reached the client — either success or an
 			// unrecoverable mid-stream error. Either way we are done.
+			p.metrics.ObserveLatency(backend.URL, time.Since(start))
 			return
 		}
 
