@@ -64,6 +64,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		lastBackend = backend
 
+		// Circuit breaker: skip this backend without making a network call.
+		// Counts as a retry (attempt increments on next iteration) per spec.
+		if backend.CB != nil && !backend.CB.Allow() {
+			p.log.Warn().
+				Str("backend", backend.URL).
+				Int("attempt", attempt+1).
+				Msg("circuit open; skipping backend")
+			continue
+		}
+
 		start := time.Now() // per-backend: measures time-to-first-byte for this attempt only
 		atomic.AddInt64(&backend.ConnCount, 1)
 		p.metrics.IncRequest(backend.URL)
@@ -74,6 +84,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Response bytes reached the client — either success or an
 			// unrecoverable mid-stream error. Either way we are done.
 			p.metrics.ObserveLatency(backend.URL, tracker.firstByte.Sub(start))
+			if backend.CB != nil {
+				backend.CB.RecordSuccess()
+			}
 			return
 		}
 
@@ -84,6 +97,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Int("attempt", attempt+1).
 			Msg("backend unreachable; marking down and retrying")
 		p.metrics.IncError(backend.URL)
+		if backend.CB != nil {
+			backend.CB.RecordFailure()
+		}
 		// Temporarily mark the backend unhealthy so subsequent picks avoid
 		// it. The health checker re-enables it once probes succeed again.
 		p.config.SetHealthy(backend.URL, false)
