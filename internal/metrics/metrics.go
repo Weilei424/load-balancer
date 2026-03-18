@@ -63,6 +63,9 @@ type Metrics struct {
 	// Updated by SetBackends from the periodic broadcast goroutine.
 	bcMu         sync.RWMutex
 	backendConns map[string]*int64
+
+	cbMu               sync.RWMutex
+	backendCircuitOpen map[string]bool
 }
 
 // rateWindow stores the previous total and the computed req/s rate.
@@ -75,10 +78,11 @@ type rateWindow struct {
 // New creates a zero-valued Metrics instance and starts the rate-tracking goroutine.
 func New() *Metrics {
 	m := &Metrics{
-		backendRequests: make(map[string]*int64),
-		backendErrors:   make(map[string]*int64),
-		backendLatency:  make(map[string]*Histogram),
-		backendConns:    make(map[string]*int64),
+		backendRequests:    make(map[string]*int64),
+		backendErrors:      make(map[string]*int64),
+		backendLatency:     make(map[string]*Histogram),
+		backendConns:       make(map[string]*int64),
+		backendCircuitOpen: make(map[string]bool),
 	}
 	go m.rateLoop()
 	return m
@@ -186,6 +190,14 @@ func (m *Metrics) SnapshotHistograms() map[string]*HistogramData {
 	return out
 }
 
+// SetCircuitStates updates the circuit-open gauge values for /metrics export.
+// Called from the periodic broadcast goroutine in cmd/lb/node.go.
+func (m *Metrics) SetCircuitStates(states map[string]bool) {
+	m.cbMu.Lock()
+	m.backendCircuitOpen = states
+	m.cbMu.Unlock()
+}
+
 // SetRaft updates the raft term and role gauges.
 func (m *Metrics) SetRaft(term int, role int32) {
 	atomic.StoreInt64(&m.RaftTerm, int64(term))
@@ -215,6 +227,16 @@ func (m *Metrics) Snapshot() map[string]int64 {
 		result["lb_backend_conn_count{url=\""+url+"\"}"] = atomic.LoadInt64(ptr)
 	}
 	m.bcMu.RUnlock()
+
+	m.cbMu.RLock()
+	for url, open := range m.backendCircuitOpen {
+		v := int64(0)
+		if open {
+			v = 1
+		}
+		result[`lb_backend_circuit_open{url="`+url+`"}`] = v
+	}
+	m.cbMu.RUnlock()
 
 	return result
 }
