@@ -114,3 +114,26 @@ func (cb *CircuitBreaker) IsOpen() bool {
 	defer cb.mu.Unlock()
 	return cb.state == cbOpen
 }
+
+// ShouldSkip returns true when the circuit should be excluded from the routing
+// pool without transitioning state. Unlike Allow(), this is side-effect-free
+// and safe to call from the router.
+//
+//   - Closed: false — backend is available.
+//   - Open, timeout not elapsed: true — exclude from pool.
+//   - Open, timeout elapsed: false — Allow() will transition to HalfOpen on
+//     the next call (probe request).
+//   - HalfOpen, probe in flight: true — only one probe at a time.
+//   - HalfOpen, no probe in flight: false — Allow() will grant the probe.
+func (cb *CircuitBreaker) ShouldSkip() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	switch cb.state {
+	case cbOpen:
+		return cb.nowFn().Sub(cb.openedAt) < openTimeout
+	case cbHalfOpen:
+		return cb.probeInFlight
+	default: // cbClosed
+		return false
+	}
+}
