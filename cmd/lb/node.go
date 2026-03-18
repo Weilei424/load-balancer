@@ -133,6 +133,17 @@ func runNode(args []string) {
 			}
 			met.SetBackends(connMap)
 
+			// Update circuit breaker state for /metrics export.
+			// config.Snapshot() returns pointers to the live Backend structs,
+			// so b.CB is the same *CircuitBreaker used by the proxy.
+			circuitStates := make(map[string]bool, len(backends))
+			for _, b := range backends {
+				if b.CB != nil {
+					circuitStates[b.URL] = b.CB.IsOpen()
+				}
+			}
+			met.SetCircuitStates(circuitStates)
+
 			broadcaster.Broadcast(dashHandler.BuildSnapshot())
 		}
 	}()
