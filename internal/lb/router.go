@@ -4,17 +4,36 @@ import "sync/atomic"
 
 // Pick selects the next backend according to the configured algorithm.
 // Returns nil if there are no healthy backends.
+//
+// Backends whose circuit breaker is blocked (Open, timeout not yet elapsed, or
+// HalfOpen with a probe already in flight) are excluded from the candidate
+// pool. If every healthy backend is currently blocked, the full healthy slice
+// is used as a fallback so that probe requests can still fire via Allow().
 func (cs *ConfigState) Pick() *Backend {
 	healthy := cs.HealthyBackends()
 	if len(healthy) == 0 {
 		return nil
 	}
+
+	// Build candidate pool excluding circuit-blocked backends.
+	available := make([]*Backend, 0, len(healthy))
+	for _, b := range healthy {
+		if b.CB == nil || !b.CB.ShouldSkip() {
+			available = append(available, b)
+		}
+	}
+	if len(available) == 0 {
+		// All healthy backends are circuit-open; fall back to the full pool so
+		// probe requests can eventually transition circuits to HalfOpen.
+		available = healthy
+	}
+
 	algo := cs.Algorithm()
 	switch algo {
 	case AlgoLeastConn:
-		return pickLeastConn(healthy)
+		return pickLeastConn(available)
 	default:
-		return pickWeightedRoundRobin(cs, healthy)
+		return pickWeightedRoundRobin(cs, available)
 	}
 }
 
