@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -83,6 +84,72 @@ func TestProxyRetrySucceedsOnSecondBackend(t *testing.T) {
 		if b.URL == deadURL {
 			t.Fatal("dead backend should be marked unhealthy after proxy error")
 		}
+	}
+}
+
+func TestProxy5xxOpensCircuit(t *testing.T) {
+	// Backend always returns 500. The circuit breaker must count these as
+	// failures; the backend remains healthy (SetHealthy is not called for
+	// responses that start writing), so Pick() keeps returning it until the
+	// circuit opens after failureThreshold requests.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cs := NewConfigState()
+	cs.Apply(Command{Op: OpAddBackend, URL: srv.URL, Weight: 1})
+	p := NewProxy(cs, metrics.New(), zerolog.Nop())
+
+	for i := 0; i < failureThreshold; i++ {
+		p.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}
+
+	backends, _ := cs.Snapshot()
+	if len(backends) == 0 {
+		t.Fatal("no backends configured")
+	}
+	if !backends[0].CB.IsOpen() {
+		t.Fatal("circuit must be open after failureThreshold 5xx responses")
+	}
+}
+
+func TestProxyResponseHeaderTimeoutOpensCircuit(t *testing.T) {
+	// Backend accepts the connection but never writes response headers,
+	// simulating a stalled slow backend.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	// Shorten the response-header timeout so the test completes in ~250 ms.
+	// backendTransport is read by getProxy() on first use; overriding it before
+	// the first ServeHTTP call is sufficient because each test gets a fresh Proxy.
+	old := backendTransport
+	backendTransport = &http.Transport{ResponseHeaderTimeout: 50 * time.Millisecond}
+	defer func() { backendTransport = old }()
+
+	cs := NewConfigState()
+	cs.Apply(Command{Op: OpAddBackend, URL: srv.URL, Weight: 1})
+	p := NewProxy(cs, metrics.New(), zerolog.Nop())
+
+	// Each ServeHTTP: transport times out → tracker.started=false →
+	// RecordFailure() + SetHealthy(false). Re-enable between calls to
+	// accumulate failureThreshold failures against the circuit breaker.
+	for i := 0; i < failureThreshold; i++ {
+		cs.SetHealthy(srv.URL, true)
+		p.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}
+
+	backends, _ := cs.Snapshot()
+	if len(backends) == 0 {
+		t.Fatal("no backends configured")
+	}
+	if !backends[0].CB.IsOpen() {
+		t.Fatal("circuit must be open after failureThreshold response-header timeouts")
 	}
 }
 

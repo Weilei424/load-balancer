@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRoundRobinDistribution(t *testing.T) {
@@ -143,6 +144,66 @@ func TestWeightedLeastConn(t *testing.T) {
 		if b == nil || b.URL != "http://b2" {
 			t.Fatalf("expected b2 (lower weighted score), got %v", b)
 		}
+	}
+}
+
+func TestPickExcludesOpenCircuitLeastConn(t *testing.T) {
+	now := time.Now()
+	openCB := &CircuitBreaker{nowFn: fakeNow(&now)}
+	for i := 0; i < failureThreshold; i++ {
+		openCB.RecordFailure()
+	}
+
+	cs := &ConfigState{algorithm: AlgoLeastConn}
+	// "open" is first so least_conn tie-breaking (equal ConnCount=0) would
+	// always pick it if CB filtering were absent — that was the starvation bug.
+	open := &Backend{URL: "http://open:80", Weight: 1, Healthy: true, CB: openCB}
+	good := &Backend{URL: "http://good:80", Weight: 1, Healthy: true, CB: newCircuitBreaker()}
+	cs.backends = []*Backend{open, good}
+
+	for i := 0; i < 20; i++ {
+		got := cs.Pick()
+		if got == nil {
+			t.Fatal("Pick() returned nil with healthy backends")
+		}
+		if got.URL == open.URL {
+			t.Fatalf("Pick() returned open-circuit backend on attempt %d", i+1)
+		}
+	}
+}
+
+func TestPickHalfOpenProbeAfterTimeout(t *testing.T) {
+	now := time.Now()
+	cb := &CircuitBreaker{nowFn: fakeNow(&now)}
+	for i := 0; i < failureThreshold; i++ {
+		cb.RecordFailure()
+	}
+
+	cs := &ConfigState{algorithm: AlgoLeastConn}
+	// "open" first in list so least_conn picks it once both are in the pool.
+	open := &Backend{URL: "http://open:80", Weight: 1, Healthy: true, CB: cb}
+	good := &Backend{URL: "http://good:80", Weight: 1, Healthy: true, CB: newCircuitBreaker()}
+	cs.backends = []*Backend{open, good}
+
+	// Before openTimeout: "open" is excluded from pool; only "good" is returned.
+	for i := 0; i < 5; i++ {
+		got := cs.Pick()
+		if got == nil || got.URL != good.URL {
+			t.Fatalf("before openTimeout Pick() must return healthy backend; got %v", got)
+		}
+	}
+
+	// Advance past openTimeout: ShouldSkip() now returns false, "open" re-enters pool.
+	now = now.Add(openTimeout + time.Millisecond)
+
+	// With ConnCount=0 for both, least_conn picks "open" (first in list).
+	got := cs.Pick()
+	if got == nil || got.URL != open.URL {
+		t.Fatalf("after openTimeout Pick() must return the previously-open backend; got %v", got)
+	}
+	// Allow() transitions to HalfOpen and grants the probe.
+	if !cb.Allow() {
+		t.Fatal("Allow() must return true for the first probe after openTimeout")
 	}
 }
 
