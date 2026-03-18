@@ -8,6 +8,46 @@ import (
 	"time"
 )
 
+// TestCircuitOpenMetric verifies that lb_backend_circuit_open is emitted as a
+// gauge with correct HELP/TYPE lines and reflects the value passed to
+// SetCircuitStates: 1 when open, 0 when closed.
+func TestCircuitOpenMetric(t *testing.T) {
+	m := New()
+	const url = "http://backend.test:9090"
+
+	// --- open circuit ---
+	m.SetCircuitStates(map[string]bool{url: true})
+
+	w := httptest.NewRecorder()
+	m.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+	body, _ := io.ReadAll(w.Body)
+	out := string(body)
+
+	if !strings.Contains(out, "# HELP lb_backend_circuit_open") {
+		t.Errorf("missing # HELP line; output:\n%s", out)
+	}
+	if !strings.Contains(out, "# TYPE lb_backend_circuit_open gauge") {
+		t.Errorf("missing # TYPE gauge line; output:\n%s", out)
+	}
+	wantOpen := `lb_backend_circuit_open{url="` + url + `"} 1`
+	if !strings.Contains(out, wantOpen) {
+		t.Errorf("expected %q; output:\n%s", wantOpen, out)
+	}
+
+	// --- closed circuit ---
+	m.SetCircuitStates(map[string]bool{url: false})
+
+	w2 := httptest.NewRecorder()
+	m.Handler().ServeHTTP(w2, httptest.NewRequest("GET", "/metrics", nil))
+	body2, _ := io.ReadAll(w2.Body)
+	out2 := string(body2)
+
+	wantClosed := `lb_backend_circuit_open{url="` + url + `"} 0`
+	if !strings.Contains(out2, wantClosed) {
+		t.Errorf("expected %q; output:\n%s", wantClosed, out2)
+	}
+}
+
 // TestHandlerHistogramOutput verifies that the /metrics handler emits correct
 // Prometheus histogram lines (HELP, TYPE, _bucket, _sum, _count, +Inf).
 func TestHandlerHistogramOutput(t *testing.T) {
