@@ -9,10 +9,11 @@ import (
 
 // gaugeMetrics lists base metric names that are gauges (not monotonic counters).
 var gaugeMetrics = map[string]bool{
-	"raft_term":              true,
-	"raft_role":              true,
-	"lb_requests_per_second": true,
-	"lb_backend_conn_count":  true,
+	"raft_term":               true,
+	"raft_role":               true,
+	"lb_requests_per_second":  true,
+	"lb_backend_conn_count":   true,
+	"lb_backend_circuit_open": true,
 }
 
 // metricHelp provides human-readable descriptions for Prometheus # HELP lines.
@@ -24,6 +25,7 @@ var metricHelp = map[string]string{
 	"lb_backend_errors":                   "Total proxy errors for a specific backend.",
 	"lb_requests_per_second":              "Current request rate in requests per second (sampled over the last second).",
 	"lb_backend_conn_count":               "Current number of active in-flight connections to a backend.",
+	"lb_backend_circuit_open":             "1 if the circuit breaker for this backend is open, 0 if closed or half-open.",
 	"raft_term":                           "Current Raft term.",
 	"raft_role":                           "Current Raft role: 0=follower, 1=candidate, 2=leader.",
 }
