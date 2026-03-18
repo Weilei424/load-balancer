@@ -2,6 +2,7 @@ package lb
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -13,6 +14,19 @@ import (
 
 	"github.com/Weilei424/load-balancer/internal/metrics"
 )
+
+// backendTransport is the shared http.Transport for all reverse proxies.
+// A 5 s dial timeout and a 10 s response-header timeout bound the worst-case
+// latency of a slow or stalled backend so the circuit breaker accumulates
+// failures against it rather than blocking goroutines indefinitely.
+var backendTransport http.RoundTripper = &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout: 5 * time.Second,
+	}).DialContext,
+	ResponseHeaderTimeout: 10 * time.Second,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+}
 
 // proxyMaxRetries is the number of additional backend attempts after the first
 // failure. Total attempts = 1 + proxyMaxRetries.
@@ -45,6 +59,7 @@ func (p *Proxy) getProxy(rawURL string) *httputil.ReverseProxy {
 	}
 	target, _ := url.Parse(rawURL) // URL already validated when backend was added
 	rp := httputil.NewSingleHostReverseProxy(target)
+	rp.Transport = backendTransport
 	// Suppress the default 502 write so ServeHTTP controls the error response.
 	rp.ErrorHandler = func(http.ResponseWriter, *http.Request, error) {}
 	v, _ := p.proxies.LoadOrStore(rawURL, rp)
@@ -81,11 +96,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&backend.ConnCount, -1)
 
 		if tracker.started {
-			// Response bytes reached the client — either success or an
-			// unrecoverable mid-stream error. Either way we are done.
+			// Response bytes reached the client — cannot retry regardless of
+			// status. Record success or failure for the circuit breaker based
+			// on the upstream status code: 5xx counts as a failure so repeated
+			// error responses eventually open the circuit.
 			p.metrics.ObserveLatency(backend.URL, tracker.firstByte.Sub(start))
 			if backend.CB != nil {
-				backend.CB.RecordSuccess()
+				if tracker.statusCode >= 500 {
+					backend.CB.RecordFailure()
+				} else {
+					backend.CB.RecordSuccess()
+				}
 			}
 			return
 		}
@@ -131,16 +152,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // have reached the client yet, we can switch to a different backend and retry.
 // firstByte records the wall-clock time of the first WriteHeader or Write call,
 // used to compute time-to-first-byte latency.
+// statusCode holds the HTTP status written by the upstream (0 if Write was
+// called without a prior WriteHeader, treated as 200 for CB purposes).
 type responseWriterTracker struct {
 	http.ResponseWriter
-	started   bool
-	firstByte time.Time
+	started    bool
+	firstByte  time.Time
+	statusCode int
 }
 
 func (t *responseWriterTracker) WriteHeader(code int) {
 	if !t.started {
 		t.firstByte = time.Now()
 		t.started = true
+		t.statusCode = code
 	}
 	t.ResponseWriter.WriteHeader(code)
 }
