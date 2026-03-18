@@ -17,7 +17,8 @@ type Backend struct {
 	URL       string
 	Weight    int
 	Healthy   bool
-	ConnCount int64 // atomic; in-flight connections (for least_conn)
+	ConnCount int64           // atomic; in-flight connections (for least_conn)
+	CB        *CircuitBreaker // per-backend circuit breaker; nil only in unit-test stubs
 
 	// swrr is the smooth weighted round-robin current weight.
 	// Modified only while ConfigState.swrrMu is held.
@@ -59,6 +60,7 @@ func (cs *ConfigState) Apply(cmd Command) {
 				URL:     cmd.URL,
 				Weight:  w,
 				Healthy: true,
+				CB:      newCircuitBreaker(),
 			})
 		}
 	case OpRemoveBackend:
@@ -191,6 +193,7 @@ func (cs *ConfigState) RestoreSnapshot(data []byte) error {
 			URL:     b.URL,
 			Weight:  b.Weight,
 			Healthy: b.Healthy,
+			CB:      newCircuitBreaker(),
 		})
 	}
 	if snap.Algorithm != "" {
