@@ -67,6 +67,43 @@ func TestConsistentHashRemoveBackend(t *testing.T) {
 	}
 }
 
+// TestConsistentHashHealthTransition verifies that marking a backend unhealthy
+// rebuilds the ring immediately so Pick() never returns the down backend.
+func TestConsistentHashHealthTransition(t *testing.T) {
+	cs := NewConfigState()
+	cs.Apply(Command{Op: OpAddBackend, URL: "http://a", Weight: 1})
+	cs.Apply(Command{Op: OpAddBackend, URL: "http://b", Weight: 1})
+	cs.Apply(Command{Op: OpAddBackend, URL: "http://c", Weight: 1})
+	cs.Apply(Command{Op: OpSetAlgorithm, Algorithm: AlgoConsistentHash})
+
+	// Find a key that maps to http://b while all backends are healthy.
+	var keyForB string
+	for i := 0; i < 10000; i++ {
+		k := fmt.Sprintf("hk-%d", i)
+		if b := cs.Pick(k); b != nil && b.URL == "http://b" {
+			keyForB = k
+			break
+		}
+	}
+	if keyForB == "" {
+		t.Fatal("could not find a key that maps to http://b")
+	}
+
+	// Mark http://b unhealthy — ring must be rebuilt.
+	cs.SetHealthy("http://b", false)
+
+	// All picks for keyForB must now return a non-nil, non-b backend.
+	for i := 0; i < 50; i++ {
+		b := cs.Pick(keyForB)
+		if b == nil {
+			t.Fatal("Pick returned nil after backend went unhealthy")
+		}
+		if b.URL == "http://b" {
+			t.Fatalf("Pick returned unhealthy backend http://b on attempt %d", i+1)
+		}
+	}
+}
+
 func TestConsistentHashCBFallback(t *testing.T) {
 	now := time.Now()
 	openCB := func() *CircuitBreaker {
