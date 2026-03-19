@@ -135,6 +135,7 @@ func (cs *ConfigState) SetHealthy(url string, healthy bool) bool {
 	if b := cs.findBackend(url); b != nil {
 		if b.Healthy != healthy {
 			b.Healthy = healthy
+			cs.rebuildRing()
 			return true
 		}
 	}
