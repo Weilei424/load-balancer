@@ -70,8 +70,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tracker := &responseWriterTracker{ResponseWriter: w}
 	var lastBackend *Backend
 
+	key := clientIP(r)
 	for attempt := 0; attempt <= proxyMaxRetries; attempt++ {
-		backend := p.config.Pick()
+		backend := p.config.Pick(key)
 		if backend == nil {
 			// No healthy backend available — could be the very first attempt
 			// (nothing configured) or a mid-retry exhaustion (all marked down).
@@ -144,6 +145,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadGateway)
 	json.NewEncoder(w).Encode(map[string]string{"error": "bad gateway"}) //nolint:errcheck
+}
+
+// clientIP extracts the client IP from the request. It prefers the
+// X-Real-IP header (set by a trusted upstream proxy) and falls back to
+// the TCP remote address.
+func clientIP(r *http.Request) string {
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // responseWriterTracker wraps an http.ResponseWriter and records whether any
