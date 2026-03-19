@@ -79,7 +79,7 @@ func adminSetWeight(args []string) {
 
 func adminSetAlgorithm(args []string) {
 	fs := flag.NewFlagSet("set-algorithm", flag.ExitOnError)
-	algo := fs.String("algorithm", "round_robin", "algorithm: round_robin|least_conn")
+	algo := fs.String("algorithm", "round_robin", "algorithm: round_robin|least_conn|consistent_hash")
 	nodes := fs.String("nodes", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "LB node HTTP addresses")
 	leader := fs.String("leader", "", "send directly to this leader address, skipping node discovery")
 	fs.Parse(args) //nolint:errcheck
