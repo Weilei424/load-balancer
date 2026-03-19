@@ -17,7 +17,7 @@ func (cs *ConfigState) Pick(key string) *Backend {
 		return nil
 	}
 
-	if cs.Algorithm() == AlgoConsistentHash {
+	if cs.Algorithm() == AlgoConsistentHash && key != "" {
 		return cs.pickConsistentHash(key, healthy)
 	}
 
