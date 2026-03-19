@@ -2,7 +2,7 @@ BINARY := lb
 BUILD_DIR := ./bin
 PKG := github.com/Weilei424/load-balancer/cmd/lb
 
-.PHONY: all build test race demo chaos loadtest clean fmt vet
+.PHONY: all build test race demo chaos loadtest bench clean fmt vet
 
 all: build
 
@@ -30,6 +30,9 @@ chaos: build
 
 loadtest: build
 	@bash scripts/loadtest.sh
+
+bench:
+	go test -bench=. -benchmem -run=^$$ -count=3 ./...
 
 clean:
 	rm -rf $(BUILD_DIR) data/
