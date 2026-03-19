@@ -16,7 +16,7 @@ func TestRoundRobinDistribution(t *testing.T) {
 	counts := map[string]int{}
 	n := 300
 	for i := 0; i < n; i++ {
-		b := cs.Pick()
+		b := cs.Pick("")
 		if b == nil {
 			t.Fatal("Pick returned nil")
 		}
@@ -39,7 +39,7 @@ func TestLeastConnPrefersIdle(t *testing.T) {
 	cs.backends = []*Backend{b1, b2}
 
 	for i := 0; i < 20; i++ {
-		b := cs.Pick()
+		b := cs.Pick("")
 		if b == nil || b.URL != "http://b2" {
 			t.Fatalf("expected b2 (idle), got %v", b)
 		}
@@ -48,7 +48,7 @@ func TestLeastConnPrefersIdle(t *testing.T) {
 
 func TestPickReturnsNilWithNoBackends(t *testing.T) {
 	cs := NewConfigState()
-	if cs.Pick() != nil {
+	if cs.Pick("") != nil {
 		t.Fatal("Pick must return nil when there are no backends")
 	}
 }
@@ -57,7 +57,7 @@ func TestPickReturnsNilWhenAllUnhealthy(t *testing.T) {
 	cs := NewConfigState()
 	cs.Apply(Command{Op: OpAddBackend, URL: "http://b1"})
 	cs.SetHealthy("http://b1", false)
-	if cs.Pick() != nil {
+	if cs.Pick("") != nil {
 		t.Fatal("Pick must return nil when all backends are unhealthy")
 	}
 }
@@ -73,7 +73,7 @@ func TestConcurrentPick(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if cs.Pick() == nil {
+			if cs.Pick("") == nil {
 				atomic.AddInt64(&failures, 1)
 			}
 		}()
@@ -112,7 +112,7 @@ func TestWeightedRoundRobin(t *testing.T) {
 	counts := map[string]int{}
 	n := 300
 	for i := 0; i < n; i++ {
-		b := cs.Pick()
+		b := cs.Pick("")
 		if b == nil {
 			t.Fatal("Pick returned nil")
 		}
@@ -140,7 +140,7 @@ func TestWeightedLeastConn(t *testing.T) {
 	cs.backends = []*Backend{b1, b2}
 
 	for i := 0; i < 20; i++ {
-		b := cs.Pick()
+		b := cs.Pick("")
 		if b == nil || b.URL != "http://b2" {
 			t.Fatalf("expected b2 (lower weighted score), got %v", b)
 		}
@@ -162,7 +162,7 @@ func TestPickExcludesOpenCircuitLeastConn(t *testing.T) {
 	cs.backends = []*Backend{open, good}
 
 	for i := 0; i < 20; i++ {
-		got := cs.Pick()
+		got := cs.Pick("")
 		if got == nil {
 			t.Fatal("Pick() returned nil with healthy backends")
 		}
@@ -187,7 +187,7 @@ func TestPickHalfOpenProbeAfterTimeout(t *testing.T) {
 
 	// Before openTimeout: "open" is excluded from pool; only "good" is returned.
 	for i := 0; i < 5; i++ {
-		got := cs.Pick()
+		got := cs.Pick("")
 		if got == nil || got.URL != good.URL {
 			t.Fatalf("before openTimeout Pick() must return healthy backend; got %v", got)
 		}
@@ -197,7 +197,7 @@ func TestPickHalfOpenProbeAfterTimeout(t *testing.T) {
 	now = now.Add(openTimeout + time.Millisecond)
 
 	// With ConnCount=0 for both, least_conn picks "open" (first in list).
-	got := cs.Pick()
+	got := cs.Pick("")
 	if got == nil || got.URL != open.URL {
 		t.Fatalf("after openTimeout Pick() must return the previously-open backend; got %v", got)
 	}
