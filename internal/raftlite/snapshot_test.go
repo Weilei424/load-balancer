@@ -223,10 +223,10 @@ func TestSnapshotAndRestore(t *testing.T) {
 	applyCh := make(chan LogEntry, 256)
 	proposeCh := make(chan ProposeReq, 8)
 	n1r, err := NewNode(Config{
-		ID:        "n1",
-		Peers:     map[string]string{"n2": addr2},
-		HTTPPeers: map[string]string{},
-		DataDir:   dataDir1,
+		ID:          "n1",
+		Peers:       map[string]string{"n2": addr2},
+		HTTPPeers:   map[string]string{},
+		DataDir:     dataDir1,
 		Snapshotter: func() []byte { return []byte(`{"state":"snap"}`) },
 		ApplySnapshot: func(_ []byte) error {
 			snapshotApplied.Store(true)
