@@ -3,16 +3,22 @@ package lb
 import "sync/atomic"
 
 // Pick selects the next backend according to the configured algorithm.
+// key is the client identifier used for consistent hashing (typically the
+// client IP); it is ignored by round-robin and least-conn algorithms.
 // Returns nil if there are no healthy backends.
 //
 // Backends whose circuit breaker is blocked (Open, timeout not yet elapsed, or
 // HalfOpen with a probe already in flight) are excluded from the candidate
 // pool. If every healthy backend is currently blocked, the full healthy slice
 // is used as a fallback so that probe requests can still fire via Allow().
-func (cs *ConfigState) Pick() *Backend {
+func (cs *ConfigState) Pick(key string) *Backend {
 	healthy := cs.HealthyBackends()
 	if len(healthy) == 0 {
 		return nil
+	}
+
+	if cs.Algorithm() == AlgoConsistentHash {
+		return cs.pickConsistentHash(key, healthy)
 	}
 
 	// Build candidate pool excluding circuit-blocked backends.
@@ -28,13 +34,47 @@ func (cs *ConfigState) Pick() *Backend {
 		available = healthy
 	}
 
-	algo := cs.Algorithm()
-	switch algo {
+	switch cs.Algorithm() {
 	case AlgoLeastConn:
 		return pickLeastConn(available)
 	default:
 		return pickWeightedRoundRobin(cs, available)
 	}
+}
+
+// pickConsistentHash routes key to a backend via the hash ring, walking
+// clockwise past circuit-open backends.
+func (cs *ConfigState) pickConsistentHash(key string, healthy []*Backend) *Backend {
+	cs.mu.RLock()
+	ring := cs.ring
+	cs.mu.RUnlock()
+
+	if ring == nil || len(ring.nodes) == 0 {
+		return pickWeightedRoundRobin(cs, healthy)
+	}
+
+	// Build skip set: backends whose circuit breaker is open.
+	skip := make(map[string]bool)
+	for _, b := range healthy {
+		if b.CB != nil && b.CB.ShouldSkip() {
+			skip[b.URL] = true
+		}
+	}
+
+	url := ring.Get(key, skip)
+	if url == "" {
+		// All circuit-open: retry without skip so probes can fire.
+		url = ring.Get(key, nil)
+	}
+	if url == "" {
+		return nil
+	}
+	for _, b := range healthy {
+		if b.URL == url {
+			return b
+		}
+	}
+	return nil
 }
 
 // pickWeightedRoundRobin implements Nginx's smooth weighted round-robin (SWRR).
