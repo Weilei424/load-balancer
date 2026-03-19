@@ -281,6 +281,27 @@ func TestAdminHandlerSetAlgorithmValidation(t *testing.T) {
 	}
 }
 
+func TestAdminHandlerSetAlgorithmConsistentHash(t *testing.T) {
+	mock := &mockRaftNode{isLeader: true}
+	h := newTestHandler(mock)
+
+	body, _ := json.Marshal(map[string]string{"algorithm": "consistent_hash"})
+	req := httptest.NewRequest(http.MethodPut, "/admin/algorithm", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 for consistent_hash, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var cmd Command
+	json.Unmarshal(mock.lastProposed, &cmd) //nolint:errcheck
+	if cmd.Op != OpSetAlgorithm || cmd.Algorithm != AlgoConsistentHash {
+		t.Errorf("unexpected command: %+v", cmd)
+	}
+}
+
 func TestAdminHandlerProposeError(t *testing.T) {
 	mock := &mockRaftNode{isLeader: true, proposeErr: errors.New("not leader")}
 	h := newTestHandler(mock)
