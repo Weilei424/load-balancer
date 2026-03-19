@@ -8,8 +8,9 @@ import (
 
 // Algorithm names for routing selection.
 const (
-	AlgoRoundRobin = "round_robin"
-	AlgoLeastConn  = "least_conn"
+	AlgoRoundRobin     = "round_robin"
+	AlgoLeastConn      = "least_conn"
+	AlgoConsistentHash = "consistent_hash"
 )
 
 // Backend represents a single upstream backend server.
@@ -32,6 +33,7 @@ type ConfigState struct {
 	mu        sync.RWMutex
 	backends  []*Backend
 	algorithm string
+	ring      *HashRing // rebuilt on Apply() and RestoreSnapshot()
 
 	// swrrMu serialises the smooth weighted round-robin per-backend current-weight
 	// updates across concurrent Pick calls.
@@ -74,10 +76,17 @@ func (cs *ConfigState) Apply(cmd Command) {
 			b.Weight = w
 		}
 	case OpSetAlgorithm:
-		if cmd.Algorithm == AlgoRoundRobin || cmd.Algorithm == AlgoLeastConn {
+		if cmd.Algorithm == AlgoRoundRobin || cmd.Algorithm == AlgoLeastConn || cmd.Algorithm == AlgoConsistentHash {
 			cs.algorithm = cmd.Algorithm
 		}
 	}
+	cs.rebuildRing()
+}
+
+// rebuildRing reconstructs the consistent hash ring from current backends.
+// Caller must hold cs.mu (write lock).
+func (cs *ConfigState) rebuildRing() {
+	cs.ring = newHashRing(cs.backends)
 }
 
 // Snapshot returns a read-only copy of all backends and the algorithm.
@@ -199,5 +208,6 @@ func (cs *ConfigState) RestoreSnapshot(data []byte) error {
 	if snap.Algorithm != "" {
 		cs.algorithm = snap.Algorithm
 	}
+	cs.rebuildRing()
 	return nil
 }
