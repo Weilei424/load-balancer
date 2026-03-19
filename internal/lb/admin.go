@@ -126,8 +126,8 @@ func (ah *AdminHandler) handleSetAlgorithm(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if req.Algorithm != AlgoRoundRobin && req.Algorithm != AlgoLeastConn {
-		http.Error(w, `{"error":"algorithm must be \"round_robin\" or \"least_conn\""}`, http.StatusBadRequest)
+	if req.Algorithm != AlgoRoundRobin && req.Algorithm != AlgoLeastConn && req.Algorithm != AlgoConsistentHash {
+		http.Error(w, `{"error":"algorithm must be \"round_robin\", \"least_conn\", or \"consistent_hash\""}`, http.StatusBadRequest)
 		return
 	}
 	ah.propose(w, Command{Op: OpSetAlgorithm, Algorithm: req.Algorithm})
