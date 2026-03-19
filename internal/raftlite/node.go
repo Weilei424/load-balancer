@@ -26,8 +26,8 @@ type Node struct {
 
 	// snapshot is the current compacted snapshot (LastIncludedIndex=0 → none).
 	snapshot      Snapshot
-	snapThreshold int           // effective threshold; triggers auto-snapshot
-	snapshotter   func() []byte // serializes state machine; nil disables auto-snapshotting
+	snapThreshold int                // effective threshold; triggers auto-snapshot
+	snapshotter   func() []byte      // serializes state machine; nil disables auto-snapshotting
 	applySnapshot func([]byte) error // restores state machine; called synchronously, no lock held
 
 	electionTimer   *time.Timer
@@ -195,7 +195,10 @@ func (n *Node) Run() {
 			}
 			idx := lastIndex(n.ps.Log)
 			n.pending[idx] = req.ReplyCh
-			// Kick off replication immediately.
+			// Check for single-node quorum before replicating to peers:
+			// if the leader is the only member, the entry is committed immediately.
+			n.tryAdvanceCommitIndex()
+			// Kick off replication to remaining peers.
 			n.sendHeartbeats()
 			n.mu.Unlock()
 		}
@@ -403,6 +406,12 @@ func (n *Node) startElection() {
 	var voteMu sync.Mutex
 
 	n.withStateLocked(n.log.Info()).Msg("starting election")
+
+	// Single-node cluster: already have a quorum with our own vote alone.
+	if votes*2 > total {
+		n.becomeLeader()
+		return
+	}
 
 	for peerID, peerAddr := range n.peers {
 		go func(pid, addr string) {
