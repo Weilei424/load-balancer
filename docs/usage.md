@@ -144,7 +144,10 @@ Switch routing algorithm:
 ```bash
 ./bin/lb admin set-algorithm --algorithm least_conn
 ./bin/lb admin set-algorithm --algorithm round_robin
+./bin/lb admin set-algorithm --algorithm consistent_hash
 ```
+
+With `consistent_hash`, each client IP is mapped to a consistent backend via a CRC32 virtual-node ring. The same source IP always reaches the same backend as long as it is healthy. When a backend goes down the ring re-routes only the affected keys; all other clients stay pinned to their original backends.
 
 ## Send Traffic
 

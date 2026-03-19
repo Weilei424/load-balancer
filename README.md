@@ -16,14 +16,15 @@ Each LB node exposes:
 Backends are simple HTTP servers with a `/health` endpoint. Once backends are added through the admin API, all nodes eventually apply the same configuration and can proxy requests using their local state. Reads are local and fast; writes are leader-only and replicated through the Raft log.
 
 Current routing behavior:
-- `round_robin`
-- `least_conn`
+- `round_robin` — smooth weighted round-robin (SWRR), proportional to backend weight
+- `least_conn` — weighted least connections; lowest `active_conns / weight` wins
+- `consistent_hash` — CRC32 virtual-node ring; same client IP always reaches the same backend; ring-walks past circuit-open backends
 
 Current replicated config commands:
 - `AddBackend(url)`
 - `RemoveBackend(url)`
 - `SetWeight(url, w)`
-- `SetAlgorithm(round_robin | least_conn)`
+- `SetAlgorithm(round_robin | least_conn | consistent_hash)`
 
 ## Highlights
 
