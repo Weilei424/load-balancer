@@ -23,16 +23,10 @@ $BIN backend --id b2 --listen :9102 &
 $BIN backend --id b3 --listen :9103 &
 sleep 0.5
 
-PEERS="n1=:10001,n2=:10002,n3=:10003"
-HTTP_PEERS="n1=:9001,n2=:9002,n3=:9003"
-
 echo "==> Starting 3 LB nodes…"
-$BIN node --id n1 --http :9001 --raft :10001 \
-  --peers "$PEERS" --http-peers "$HTTP_PEERS" --data "$DATA/n1" &
-$BIN node --id n2 --http :9002 --raft :10002 \
-  --peers "$PEERS" --http-peers "$HTTP_PEERS" --data "$DATA/n2" &
-$BIN node --id n3 --http :9003 --raft :10003 \
-  --peers "$PEERS" --http-peers "$HTTP_PEERS" --data "$DATA/n3" &
+$BIN node --config configs/n1.yaml &
+$BIN node --config configs/n2.yaml &
+$BIN node --config configs/n3.yaml &
 
 echo "==> Waiting for leader election (3s)…"
 sleep 3
