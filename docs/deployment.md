@@ -42,15 +42,20 @@ Start backends:
 ./bin/lb backend --id b3 --listen :9103
 ```
 
-Start LB nodes:
+Start LB nodes using the provided config files (recommended):
 
 ```bash
-PEERS="n1=:10001,n2=:10002,n3=:10003"
-HTTP_PEERS="n1=:9001,n2=:9002,n3=:9003"
+./bin/lb node --config configs/n1.yaml
+./bin/lb node --config configs/n2.yaml
+./bin/lb node --config configs/n3.yaml
+```
 
-./bin/lb node --id n1 --http :9001 --raft :10001 --peers "$PEERS" --http-peers "$HTTP_PEERS" --data ./data/n1
-./bin/lb node --id n2 --http :9002 --raft :10002 --peers "$PEERS" --http-peers "$HTTP_PEERS" --data ./data/n2
-./bin/lb node --id n3 --http :9003 --raft :10003 --peers "$PEERS" --http-peers "$HTTP_PEERS" --data ./data/n3
+Or with explicit flags:
+
+```bash
+./bin/lb node --id n1 --http :9001 --raft :10001 --peers "n2=:10002,n3=:10003" --http-peers "n2=:9002,n3=:9003" --data ./data/n1
+./bin/lb node --id n2 --http :9002 --raft :10002 --peers "n1=:10001,n3=:10003" --http-peers "n1=:9001,n3=:9003" --data ./data/n2
+./bin/lb node --id n3 --http :9003 --raft :10003 --peers "n1=:10001,n2=:10002" --http-peers "n1=:9001,n2=:9002" --data ./data/n3
 ```
 
 Register backends:
@@ -132,7 +137,7 @@ Operational workflow after failure:
 
 1. Check `/raft/status` on each node.
 2. Confirm which node is leader.
-3. Restart failed nodes with the same `--id`, ports, and `--data` path.
+3. Restart failed nodes with the same config file (or the same `--id`, ports, and `--data` path).
 4. Re-run admin commands if you intentionally started from a clean data directory.
 
 ## Environment Assumptions
