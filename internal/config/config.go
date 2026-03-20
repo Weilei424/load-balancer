@@ -65,6 +65,27 @@ func PeersString(m map[string]string) string {
 	return strings.Join(parts, ",")
 }
 
+// Validate returns an error if any required field is missing.
+// Call this when a config file was explicitly provided so a typo
+// (e.g. "http_peer" instead of "http_peers") fails fast instead of
+// silently falling back to a hardcoded default and booting the wrong node.
+func Validate(cfg NodeConfig) error {
+	var missing []string
+	if cfg.ID == "" {
+		missing = append(missing, "id")
+	}
+	if cfg.HTTP == "" {
+		missing = append(missing, "http")
+	}
+	if cfg.Raft == "" {
+		missing = append(missing, "raft")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("required fields missing: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // StrOr returns s if non-empty, else fallback.
 func StrOr(s, fallback string) string {
 	if s != "" {
