@@ -11,11 +11,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-[ -f "$BIN" ] || make build
+make build
 mkdir -p "$DATA"/{n1,n2,n3}
-
-PEERS="n1=:10001,n2=:10002,n3=:10003"
-HTTP_PEERS="n1=:9001,n2=:9002,n3=:9003"
 
 # Start backends.
 $BIN backend --id b1 --listen :9101 &
@@ -26,15 +23,14 @@ sleep 0.5
 # Start LB nodes and record PIDs.
 declare -A NODE_PIDS
 start_node() {
-  local id=$1 http=$2 raft=$3
-  $BIN node --id "$id" --http ":$http" --raft ":$raft" \
-    --peers "$PEERS" --http-peers "$HTTP_PEERS" --data "$DATA/$id" &
+  local id=$1
+  $BIN node --config "configs/${id}.yaml" &
   NODE_PIDS[$id]=$!
 }
 
-start_node n1 9001 10001
-start_node n2 9002 10002
-start_node n3 9003 10003
+start_node n1
+start_node n2
+start_node n3
 
 echo "==> Waiting for leader election (4s)…"
 sleep 4
@@ -61,9 +57,7 @@ for round in $(seq 1 "$ROUNDS"); do
     kill "$pid" 2>/dev/null || true
     sleep 1
     echo "==> [chaos round $round] Restarting $target"
-    http_port=$(echo "$HTTP_PEERS" | tr ',' '\n' | grep "^${target}=" | cut -d= -f2 | tr -d ':')
-    raft_port=$(echo "$PEERS" | tr ',' '\n' | grep "^${target}=" | cut -d= -f2 | tr -d ':')
-    start_node "$target" "$http_port" "$raft_port"
+    start_node "$target"
     echo "==> $target restarted (pid ${NODE_PIDS[$target]})"
   fi
 done
