@@ -42,48 +42,39 @@ Behavior:
 
 ## Run Load Balancer Nodes
 
-Run three LB nodes in separate terminals.
+### Using config files (recommended)
 
-Node 1:
+The repository ships with ready-made config files for the three demo nodes. Run each in a separate terminal:
+
+```bash
+./bin/lb node --config configs/n1.yaml
+./bin/lb node --config configs/n2.yaml
+./bin/lb node --config configs/n3.yaml
+```
+
+Config files must supply `id`, `http`, and `raft` — missing required fields produce a startup error. CLI flags override any value from the file; for example:
+
+```bash
+./bin/lb node --config configs/n1.yaml --health-interval 10s
+```
+
+### Using flags directly
+
+All settings can be provided as flags without a config file:
 
 ```bash
 ./bin/lb node \
   --id n1 \
   --http :9001 \
   --raft :10001 \
-  --peers "n1=:10001,n2=:10002,n3=:10003" \
-  --http-peers "n1=:9001,n2=:9002,n3=:9003" \
+  --peers "n2=:10002,n3=:10003" \
+  --http-peers "n2=:9002,n3=:9003" \
   --data ./data/n1
 ```
 
-Node 2:
-
-```bash
-./bin/lb node \
-  --id n2 \
-  --http :9002 \
-  --raft :10002 \
-  --peers "n1=:10001,n2=:10002,n3=:10003" \
-  --http-peers "n1=:9001,n2=:9002,n3=:9003" \
-  --data ./data/n2
-```
-
-Node 3:
-
-```bash
-./bin/lb node \
-  --id n3 \
-  --http :9003 \
-  --raft :10003 \
-  --peers "n1=:10001,n2=:10002,n3=:10003" \
-  --http-peers "n1=:9001,n2=:9002,n3=:9003" \
-  --data ./data/n3
-```
-
 Notes:
-- `--peers` is the Raft RPC address list
-- `--http-peers` is used for leader redirect behavior on admin requests
-- the local node is automatically removed from each peer map internally
+- `--peers` is the Raft RPC address list (omit self)
+- `--http-peers` is used for leader redirect behavior on admin requests (omit self)
 - `--data` stores `state.json` and `log.jsonl`
 - `--health-interval` defaults to `5s`
 
