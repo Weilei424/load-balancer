@@ -119,6 +119,36 @@ func TestLoadInvalidYAML(t *testing.T) {
 	}
 }
 
+func TestValidateOK(t *testing.T) {
+	cfg := NodeConfig{ID: "n1", HTTP: ":9001", Raft: ":10001"}
+	if err := Validate(cfg); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateMissingFields(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  NodeConfig
+		want string
+	}{
+		{"missing id", NodeConfig{HTTP: ":9001", Raft: ":10001"}, "id"},
+		{"missing http", NodeConfig{ID: "n1", Raft: ":10001"}, "http"},
+		{"missing raft", NodeConfig{ID: "n1", HTTP: ":9001"}, "raft"},
+		{"missing all", NodeConfig{}, "id"},
+	}
+	for _, c := range cases {
+		err := Validate(c.cfg)
+		if err == nil {
+			t.Errorf("%s: expected error", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: error %q should contain %q", c.name, err.Error(), c.want)
+		}
+	}
+}
+
 func TestPeersStringEmpty(t *testing.T) {
 	if s := PeersString(nil); s != "" {
 		t.Errorf("nil map: got %q; want %q", s, "")
