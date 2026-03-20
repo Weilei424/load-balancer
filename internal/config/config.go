@@ -24,6 +24,8 @@ type NodeConfig struct {
 
 // Load reads and decodes the YAML file at path.
 // Returns the config, parsed health_interval duration (0 if unset), and any error.
+// Unknown YAML keys are rejected so typos (e.g. "http_peer" instead of "http_peers")
+// produce an immediate error rather than silently starting with wrong defaults.
 func Load(path string) (NodeConfig, time.Duration, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -31,7 +33,9 @@ func Load(path string) (NodeConfig, time.Duration, error) {
 	}
 
 	var cfg NodeConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
 		return NodeConfig{}, 0, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
