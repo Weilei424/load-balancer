@@ -62,6 +62,18 @@ td{padding:.5rem;border-bottom:1px solid #1e293b}
     <h2>Routing Algorithm</h2>
     <div class="stat" id="algo">—</div>
   </div>
+  <div class="card">
+    <h2>P95 Latency</h2>
+    <div class="stat" id="p95">0 ms</div>
+  </div>
+  <div class="card">
+    <h2>Req/s — 30 s</h2>
+    <canvas id="crps" style="width:100%;display:block"></canvas>
+  </div>
+  <div class="card">
+    <h2>Connections — 30 s</h2>
+    <canvas id="cconn" style="width:100%;display:block"></canvas>
+  </div>
 </div>
 
 <div class="card" style="margin-bottom:1rem">
@@ -82,17 +94,93 @@ const statusEl = document.getElementById('status');
 const timeline = [];
 let prevLeader = null;
 
+const RING = 60;
+const hist = []; // ring buffer of NodeSnapshot objects, max RING entries
+const crps  = document.getElementById('crps');
+const cconn = document.getElementById('cconn');
+const COLORS = ['#0ea5e9','#8b5cf6','#10b981','#f59e0b','#ef4444'];
+
+const sizeCanvases = () => [crps,cconn].forEach(c=>{c.width=c.parentElement.clientWidth-40;c.height=90;});
+[crps,cconn].forEach(c=>new ResizeObserver(()=>{sizeCanvases();drawCharts();}).observe(c.parentElement));
+sizeCanvases();
+
+function drawGrid(ctx, W, H) {
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+  for (let i = 1; i <= 3; i++) {
+    const gy = H - (i / 3) * H;
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke();
+  }
+}
+
+function drawRps(canvas) {
+  const ctx = canvas.getContext('2d'), W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  drawGrid(ctx, W, H);
+  const N = hist.length; if (N < 2) return;
+  const vals = hist.map(s => s.requests_per_second || 0);
+  const max  = Math.max(...vals, 1);
+  const x = i => i * W / (RING - 1);
+  const y = v => H - 2 - (v / max) * (H - 4);
+  ctx.beginPath();
+  vals.forEach((v, i) => ctx[i ? 'lineTo' : 'moveTo'](x(i), y(v)));
+  ctx.lineTo(x(N-1), H); ctx.lineTo(x(0), H); ctx.closePath();
+  ctx.fillStyle = '#38bdf820'; ctx.fill();
+  ctx.beginPath();
+  vals.forEach((v, i) => ctx[i ? 'lineTo' : 'moveTo'](x(i), y(v)));
+  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = '#64748b'; ctx.font = '9px system-ui'; ctx.textAlign = 'right';
+  ctx.fillText(max.toFixed(1), W - 2, 11);
+}
+
+function drawConn(canvas) {
+  const ctx = canvas.getContext('2d'), W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  drawGrid(ctx, W, H);
+  const N = hist.length; if (N < 2) return;
+  const urls = [...new Set(hist.flatMap(s => (s.backends || []).map(b => b.url)))];
+  if (!urls.length) return;
+  const series = urls.map(u => hist.map(s=>{const b=(s.backends||[]).find(b=>b.url===u);return b?b.conn_count:0;}));
+  const cum = series.map((_,si) => hist.map((_,i) => series.slice(0,si+1).reduce((a,s)=>a+s[i],0)));
+  const max = Math.max(...cum[cum.length - 1], 1);
+  const x = i => i * W / (RING - 1);
+  const y = v => H - 2 - (v / max) * (H - 4);
+  urls.forEach((_, si) => {
+    const top = cum[si], bot = si ? cum[si - 1] : hist.map(() => 0);
+    ctx.beginPath();
+    top.forEach((v, i) => ctx[i ? 'lineTo' : 'moveTo'](x(i), y(v)));
+    for (let i = N - 1; i >= 0; i--) ctx.lineTo(x(i), y(bot[i]));
+    ctx.closePath();
+    ctx.fillStyle = COLORS[si % COLORS.length] + '80'; ctx.fill();
+    ctx.beginPath();
+    top.forEach((v, i) => ctx[i ? 'lineTo' : 'moveTo'](x(i), y(v)));
+    ctx.strokeStyle = COLORS[si % COLORS.length]; ctx.lineWidth = 1; ctx.stroke();
+  });
+  // Legend inside canvas top-left. Label uses port only; same-port collision is
+  // acceptable for a single-host demo.
+  let lx = 4;
+  urls.forEach((url, si) => {
+    ctx.fillStyle = COLORS[si % COLORS.length]; ctx.fillRect(lx, 4, 8, 8);
+    ctx.fillStyle = '#94a3b8'; ctx.font = '9px system-ui'; ctx.textAlign = 'left';
+    const label = url.split(':').pop();
+    ctx.fillText(label, lx + 10, 12);
+    lx += ctx.measureText(label).width + 22;
+  });
+}
+
+function drawCharts() { drawRps(crps); drawConn(cconn); }
+
 function connect() {
   const es = new EventSource('/events');
   es.onopen = () => { statusEl.textContent = '⬤ connected'; statusEl.className = 'connected'; };
   es.onerror = () => { statusEl.textContent = '⬤ disconnected'; statusEl.className = 'disconnected'; setTimeout(connect, 3000); es.close(); };
-  es.onmessage = (e) => {
-    const d = JSON.parse(e.data);
-    update(d);
-  };
+  es.onmessage = (e) => { update(JSON.parse(e.data)); };
 }
 
 function update(d) {
+  hist.push(d); if (hist.length > RING) hist.shift();
+  document.getElementById('p95').textContent = (d.p95_latency_ms || 0) + ' ms';
+  drawCharts();
+
   document.getElementById('node-id').textContent = d.id || '—';
   const badge = document.getElementById('role-badge');
   badge.textContent = d.role || 'unknown';
@@ -107,7 +195,6 @@ function update(d) {
   document.getElementById('errs').textContent = d.errors_total ?? 0;
   document.getElementById('algo').textContent = d.algorithm || '—';
 
-  // Backends table
   const tbody = document.getElementById('backends');
   tbody.innerHTML = '';
   (d.backends || []).forEach(b => {
@@ -122,7 +209,6 @@ function update(d) {
     tbody.appendChild(tr);
   });
 
-  // Timeline
   if (d.leader_id && d.leader_id !== prevLeader) {
     prevLeader = d.leader_id;
     timeline.unshift({ leader: d.leader_id, term: d.term, at: new Date().toLocaleTimeString() });
