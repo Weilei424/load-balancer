@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Weilei424/load-balancer/internal/config"
 	"github.com/Weilei424/load-balancer/internal/dashboard"
 	"github.com/Weilei424/load-balancer/internal/lb"
 	"github.com/Weilei424/load-balancer/internal/logging"
@@ -20,14 +21,31 @@ import (
 )
 
 func runNode(args []string) {
+	// Step 1: find --config before creating FlagSet so YAML values become defaults.
+	var cfg config.NodeConfig
+	healthIntervalDefault := 5 * time.Second
+	if cfgPath, ok := extractConfigFlag(args); ok {
+		loaded, dur, err := config.Load(cfgPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		cfg = loaded
+		if dur > 0 {
+			healthIntervalDefault = dur
+		}
+	}
+
+	// Step 2: register flags with YAML values as defaults; CLI flags override.
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
-	id := fs.String("id", "n1", "node ID")
-	httpAddr := fs.String("http", ":9001", "HTTP listen address (proxy + dashboard + admin)")
-	raftAddr := fs.String("raft", ":10001", "Raft RPC listen address")
-	peersStr := fs.String("peers", "", "Raft peers: id=raftAddr,... (e.g. n1=:10001,n2=:10002)")
-	httpPeersStr := fs.String("http-peers", "", "HTTP peers: id=httpAddr,... (e.g. n1=:9001,n2=:9002)")
-	dataDir := fs.String("data", "./data/n1", "data directory for persistence")
-	healthInterval := fs.Duration("health-interval", 5*time.Second, "backend health-check interval")
+	_ = fs.String("config", "", "path to YAML config file")
+	id := fs.String("id", config.StrOr(cfg.ID, "n1"), "node ID")
+	httpAddr := fs.String("http", config.StrOr(cfg.HTTP, ":9001"), "HTTP listen address (proxy + dashboard + admin)")
+	raftAddr := fs.String("raft", config.StrOr(cfg.Raft, ":10001"), "Raft RPC listen address")
+	peersStr := fs.String("peers", config.PeersString(cfg.Peers), "Raft peers: id=raftAddr,... (e.g. n1=:10001,n2=:10002)")
+	httpPeersStr := fs.String("http-peers", config.PeersString(cfg.HTTPPeers), "HTTP peers: id=httpAddr,... (e.g. n1=:9001,n2=:9002)")
+	dataDir := fs.String("data", config.StrOr(cfg.Data, "./data/n1"), "data directory for persistence")
+	healthInterval := fs.Duration("health-interval", healthIntervalDefault, "backend health-check interval")
 	fs.Parse(args) //nolint:errcheck
 
 	logger := logging.New(*id)
@@ -209,6 +227,23 @@ func runNode(args []string) {
 	if err := mainServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal().Err(err).Msg("http server error")
 	}
+}
+
+// extractConfigFlag scans args for --config <path>, --config=<path>, -config=<path>.
+func extractConfigFlag(args []string) (string, bool) {
+	for i, a := range args {
+		switch {
+		case a == "--config" || a == "-config":
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+		case strings.HasPrefix(a, "--config="):
+			return strings.TrimPrefix(a, "--config="), true
+		case strings.HasPrefix(a, "-config="):
+			return strings.TrimPrefix(a, "-config="), true
+		}
+	}
+	return "", false
 }
 
 // parsePeers parses "id1=addr1,id2=addr2" into a map, excluding the local node.
