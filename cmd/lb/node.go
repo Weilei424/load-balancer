@@ -30,6 +30,10 @@ func runNode(args []string) {
 			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 			os.Exit(1)
 		}
+		if err := config.Validate(loaded); err != nil {
+			fmt.Fprintf(os.Stderr, "invalid config %s: %v\n", cfgPath, err)
+			os.Exit(1)
+		}
 		cfg = loaded
 		if dur > 0 {
 			healthIntervalDefault = dur
