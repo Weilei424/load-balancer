@@ -82,6 +82,32 @@ func (h *Handler) writeSSEEvent(w http.ResponseWriter, snap NodeSnapshot) {
 	fmt.Fprintf(w, "data: %s\n\n", data)
 }
 
+// p95ms computes the p95 latency in milliseconds by aggregating all per-backend
+// histograms. Returns 0 when no observations have been recorded.
+// boundsMs maps histogram bucket index (0–9) to an upper-bound in milliseconds;
+// index 9 is the +Inf sentinel displayed as 2000 ms.
+func p95ms(hists map[string]*metrics.HistogramData) float64 {
+	var agg [10]int64
+	var total int64
+	for _, h := range hists {
+		for i, c := range h.BucketCounts {
+			agg[i] += c
+		}
+		total += h.Count
+	}
+	if total == 0 {
+		return 0
+	}
+	boundsMs := [10]float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000}
+	threshold := int64(float64(total) * 0.95)
+	for i := 0; i < 9; i++ { // indices 0–8 are finite bounds
+		if agg[i] >= threshold {
+			return boundsMs[i]
+		}
+	}
+	return boundsMs[9] // +Inf bucket fallback
+}
+
 // BuildSnapshot builds the current dashboard snapshot. Exported so cmd/lb/node.go can use it.
 func (h *Handler) BuildSnapshot() NodeSnapshot {
 	return h.buildSnapshot()
@@ -102,6 +128,7 @@ func (h *Handler) buildSnapshot() NodeSnapshot {
 	}
 
 	m := h.metrics.Snapshot()
+	hists := h.metrics.SnapshotHistograms()
 	return NodeSnapshot{
 		ID:                status.ID,
 		Role:              status.Role,
@@ -115,6 +142,7 @@ func (h *Handler) buildSnapshot() NodeSnapshot {
 		RequestsTotal:     m["lb_requests_total"],
 		RequestsPerSecond: h.metrics.RequestRate(),
 		ErrorsTotal:       m["lb_errors_total"],
+		P95LatencyMs:      p95ms(hists),
 		Timestamp:         time.Now().UnixMilli(),
 	}
 }
