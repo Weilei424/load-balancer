@@ -1,0 +1,11 @@
+id: n3
+http: ":9003"
+raft: ":10003"
+peers:
+  n1: ":10001"
+  n2: ":10002"
+http_peers:
+  n1: ":9001"
+  n2: ":9002"
+data: "./data/n3"
+health_interval: 5s
