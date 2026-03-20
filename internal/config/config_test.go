@@ -119,6 +119,30 @@ func TestLoadInvalidYAML(t *testing.T) {
 	}
 }
 
+func TestLoadUnknownKey(t *testing.T) {
+	cases := []string{
+		"http_peer: \":9002\"\n",       // common typo for http_peers
+		"peerz: {}\n",                  // typo for peers
+		"health_interva: 5s\n",         // truncated key
+	}
+	for _, content := range cases {
+		f, err := os.CreateTemp("", "cfg*.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// write minimal valid fields plus the typo
+		f.WriteString("id: n1\nhttp: \":9001\"\nraft: \":10001\"\n")
+		f.WriteString(content)
+		f.Close()
+
+		_, _, err = Load(f.Name())
+		os.Remove(f.Name())
+		if err == nil {
+			t.Errorf("expected error for unknown key in: %q", content)
+		}
+	}
+}
+
 func TestValidateOK(t *testing.T) {
 	cfg := NodeConfig{ID: "n1", HTTP: ":9001", Raft: ":10001"}
 	if err := Validate(cfg); err != nil {
