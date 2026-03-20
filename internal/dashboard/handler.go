@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -99,7 +100,8 @@ func p95ms(hists map[string]*metrics.HistogramData) float64 {
 		return 0
 	}
 	boundsMs := [10]float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000}
-	threshold := int64(float64(total) * 0.95)
+	// ceil ensures a single slow observation is not misclassified into the first bucket.
+	threshold := int64(math.Ceil(float64(total) * 0.95))
 	for i := 0; i < 9; i++ { // indices 0–8 are finite bounds
 		if agg[i] >= threshold {
 			return boundsMs[i]
