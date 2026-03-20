@@ -26,6 +26,7 @@ type NodeSnapshot struct {
 	RequestsTotal     int64   `json:"requests_total"`
 	RequestsPerSecond float64 `json:"requests_per_second"`
 	ErrorsTotal       int64   `json:"errors_total"`
+	P95LatencyMs      float64 `json:"p95_latency_ms"`
 	Timestamp         int64   `json:"timestamp"` // unix millis
 }
 
