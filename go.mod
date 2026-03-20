@@ -2,7 +2,10 @@ module github.com/Weilei424/load-balancer
 
 go 1.24.3
 
-require github.com/rs/zerolog v1.34.0
+require (
+	github.com/rs/zerolog v1.34.0
+	gopkg.in/yaml.v3 v3.0.1 // YAML config file support; no transitive deps
+)
 
 require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
