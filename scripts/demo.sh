@@ -12,8 +12,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Build if needed.
-[ -f "$BIN" ] || make build
+make build
 
 mkdir -p "$DATA"/{n1,n2,n3}
 
