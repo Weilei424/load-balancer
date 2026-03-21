@@ -1,0 +1,118 @@
+name: raft-lb
+
+services:
+
+  # ── Backend echo servers ──────────────────────────────────────────────────
+
+  backend1:
+    build: .
+    command: ["backend", "--id", "b1", "--listen", ":9101"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9101/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  backend2:
+    build: .
+    command: ["backend", "--id", "b2", "--listen", ":9102"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9102/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  backend3:
+    build: .
+    command: ["backend", "--id", "b3", "--listen", ":9103"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9103/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ── LB nodes ─────────────────────────────────────────────────────────────
+
+  lb1:
+    build: .
+    command: ["node", "--config", "configs/docker/n1.yaml"]
+    ports:
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9001/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      backend1:
+        condition: service_healthy
+      backend2:
+        condition: service_healthy
+      backend3:
+        condition: service_healthy
+
+  lb2:
+    build: .
+    command: ["node", "--config", "configs/docker/n2.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9002/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      backend1:
+        condition: service_healthy
+      backend2:
+        condition: service_healthy
+      backend3:
+        condition: service_healthy
+
+  lb3:
+    build: .
+    command: ["node", "--config", "configs/docker/n3.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9003/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      backend1:
+        condition: service_healthy
+      backend2:
+        condition: service_healthy
+      backend3:
+        condition: service_healthy
+
+  # ── One-shot setup: adds backends via Raft after cluster is healthy ───────
+
+  setup:
+    build: .
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for leader election..."
+        sleep 5
+        /app/lb admin add-backend \
+          --url http://backend1:9101 \
+          --nodes "http://lb1:9001,http://lb2:9002,http://lb3:9003"
+        /app/lb admin add-backend \
+          --url http://backend2:9102 \
+          --nodes "http://lb1:9001,http://lb2:9002,http://lb3:9003"
+        /app/lb admin add-backend \
+          --url http://backend3:9103 \
+          --nodes "http://lb1:9001,http://lb2:9002,http://lb3:9003"
+        echo "Setup complete."
+    depends_on:
+      lb1:
+        condition: service_healthy
+      lb2:
+        condition: service_healthy
+      lb3:
+        condition: service_healthy
+    restart: "no"
