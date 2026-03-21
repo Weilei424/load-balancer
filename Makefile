@@ -2,7 +2,7 @@ BINARY := lb
 BUILD_DIR := ./bin
 PKG := github.com/Weilei424/load-balancer/cmd/lb
 
-.PHONY: all build test race demo chaos loadtest bench clean fmt vet
+.PHONY: all build test race demo chaos loadtest bench clean fmt vet docker-demo docker-clean
 
 all: build
 
@@ -36,3 +36,9 @@ bench:
 
 clean:
 	rm -rf $(BUILD_DIR) data/
+
+docker-demo:
+	docker compose up --build
+
+docker-clean:
+	docker compose down -v --rmi local
