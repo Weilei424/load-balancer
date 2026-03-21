@@ -42,7 +42,7 @@ services:
     ports:
       - "9001:9001"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9001/metrics"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9001/health"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -61,7 +61,7 @@ services:
     ports:
       - "9002:9002"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9002/metrics"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9002/health"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -80,7 +80,7 @@ services:
     ports:
       - "9003:9003"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9003/metrics"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9003/health"]
       interval: 5s
       timeout: 3s
       retries: 10
