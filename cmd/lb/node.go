@@ -189,6 +189,11 @@ func runNode(args []string) {
 	// Metrics.
 	mainMux.Handle("/metrics", met.Handler())
 
+	// Health check (always 200; used by Docker Compose and monitoring).
+	mainMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
 	// Admin routes (leader-only; followers 307 redirect).
 	adminHandler := lb.NewAdminHandler(raftNode, logger)
 	mainMux.Handle("/admin/", adminHandler)
