@@ -58,6 +58,8 @@ services:
   lb2:
     build: .
     command: ["node", "--config", "configs/docker/n2.yaml"]
+    ports:
+      - "9002:9002"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9002/metrics"]
       interval: 5s
@@ -75,6 +77,8 @@ services:
   lb3:
     build: .
     command: ["node", "--config", "configs/docker/n3.yaml"]
+    ports:
+      - "9003:9003"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9003/metrics"]
       interval: 5s
@@ -96,17 +100,22 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo "Waiting for leader election..."
-        sleep 5
-        /app/lb admin add-backend \
-          --url http://backend1:9101 \
-          --nodes "http://lb1:9001,http://lb2:9002,http://lb3:9003"
-        /app/lb admin add-backend \
-          --url http://backend2:9102 \
-          --nodes "http://lb1:9001,http://lb2:9002,http://lb3:9003"
-        /app/lb admin add-backend \
-          --url http://backend3:9103 \
-          --nodes "http://lb1:9001,http://lb2:9002,http://lb3:9003"
+        NODES="http://lb1:9001,http://lb2:9002,http://lb3:9003"
+        add_backend() {
+          local url="$1" attempt=0
+          until /app/lb admin add-backend --url "$url" --nodes "$NODES"; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 20 ]; then
+              echo "ERROR: failed to register $url after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "No leader yet, retrying $url in 3s (attempt $attempt)..."
+            sleep 3
+          done
+        }
+        add_backend http://backend1:9101
+        add_backend http://backend2:9102
+        add_backend http://backend3:9103
         echo "Setup complete."
     depends_on:
       lb1:
