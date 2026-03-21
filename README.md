@@ -35,16 +35,24 @@ Current replicated config commands:
 - Live dashboard over Server-Sent Events
 - Prometheus-style metrics and structured zerolog output
 - Demo, load, and chaos scripts for local operation
+- Docker Compose path — full cluster with one command, no Go required
 
 ## Quick Start
 
+**With Go installed:**
 ```bash
 make build
 make test
 make demo
 ```
 
-Useful endpoints after `make demo`:
+**With Docker only:**
+```bash
+make docker-demo       # docker compose up --build
+make docker-clean      # docker compose down -v --rmi local
+```
+
+Useful endpoints after either demo:
 - Dashboard: `http://localhost:9001/`
 - Dashboard: `http://localhost:9002/`
 - Dashboard: `http://localhost:9003/`
@@ -60,7 +68,10 @@ internal/lb/           Proxy, routing, health checks, admin handlers, state mach
 internal/dashboard/    Dashboard HTML and SSE broadcasting
 internal/metrics/      Prometheus-style metrics rendering
 internal/logging/      zerolog setup
+configs/docker/        Docker-aware node configs (peer addresses use service names)
 scripts/               demo, load test, and chaos helpers
+Dockerfile             Multi-stage build (golang:1.24-alpine → alpine:latest)
+docker-compose.yml     Full 6-process cluster (3 backends + 3 LB nodes + setup)
 ```
 
 ## Documentation
