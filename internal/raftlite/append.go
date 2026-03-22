@@ -135,7 +135,7 @@ func (n *Node) replicateToPeer(peerID, peerAddr string) {
 			LastIncludedTerm:  snap.LastIncludedTerm,
 			Data:              snap.Data,
 		}
-		reply, err := sendInstallSnapshot(peerAddr, args)
+		reply, err := n.sendInstallSnapshot(peerAddr, args)
 		if err != nil {
 			return
 		}
@@ -177,7 +177,7 @@ func (n *Node) replicateToPeer(peerID, peerAddr string) {
 	}
 	n.mu.Unlock()
 
-	reply, err := sendAppend(peerAddr, args)
+	reply, err := n.sendAppend(peerAddr, args)
 	if err != nil {
 		return
 	}
