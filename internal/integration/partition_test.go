@@ -57,9 +57,10 @@ func (pt *partitionedTransport) RoundTrip(req *http.Request) (*http.Response, er
 
 // bootPartitionCluster creates n raftlite nodes each equipped with a
 // partitionedTransport for controllable partition injection. It returns the
-// cluster nodes, per-node transports, and per-node raft base addresses (as
-// "host:port" strings, matching the key format used by partitionedTransport).
-func bootPartitionCluster(t *testing.T, n int) ([]*clusterNode, []*partitionedTransport, []string) {
+// cluster nodes, per-node transports, per-node raft host:port strings (for use
+// in block/unblock calls), and the per-node apply channels so callers can wire
+// up state machines.
+func bootPartitionCluster(t *testing.T, n int) ([]*clusterNode, []*partitionedTransport, []string, []chan raftlite.LogEntry) {
 	t.Helper()
 
 	lns := make([]net.Listener, n)
@@ -86,6 +87,7 @@ func bootPartitionCluster(t *testing.T, n int) ([]*clusterNode, []*partitionedTr
 	}
 
 	nodes := make([]*clusterNode, n)
+	applyChans := make([]chan raftlite.LogEntry, n)
 	for i, id := range ids {
 		peers := make(map[string]string, n-1)
 		for pid, pa := range addrMap {
@@ -94,11 +96,7 @@ func bootPartitionCluster(t *testing.T, n int) ([]*clusterNode, []*partitionedTr
 			}
 		}
 		applyCh := make(chan raftlite.LogEntry, 64)
-		// Drain apply channel so it never blocks the node.
-		go func(ch chan raftlite.LogEntry) {
-			for range ch {
-			}
-		}(applyCh)
+		applyChans[i] = applyCh
 		proposeCh := make(chan raftlite.ProposeReq, 8)
 		nd, err := raftlite.NewNode(raftlite.Config{
 			ID:        id,
@@ -122,7 +120,7 @@ func bootPartitionCluster(t *testing.T, n int) ([]*clusterNode, []*partitionedTr
 		}
 	})
 
-	return nodes, transports, hostPorts
+	return nodes, transports, hostPorts, applyChans
 }
 
 // waitForLeaderAmong polls a subset of nodes for a leader, up to timeout.
@@ -179,9 +177,23 @@ func waitForCommitConvergence(t *testing.T, nodes []*clusterNode, minCommit int,
 	t.Fatalf("nodes did not converge to commitIndex >= %d within %v", minCommit, timeout)
 }
 
-// TestNetworkPartition boots a 5-node cluster, cuts it into a 2-node minority
-// and a 3-node majority, asserts the minority cannot commit, the majority can,
-// and that the minority nodes catch up after the partition is healed.
+// hasBackend reports whether cs contains a backend with the given URL.
+func hasBackend(cs *lb.ConfigState, url string) bool {
+	for _, b := range cs.AllBackends() {
+		if b.URL == url {
+			return true
+		}
+	}
+	return false
+}
+
+// TestNetworkPartition boots a 5-node cluster and cuts it such that the
+// pre-partition leader is always in the 2-node minority. It verifies:
+//
+//  1. The isolated leader cannot commit (no majority).
+//  2. The 3-node majority elects a new leader and commits successfully.
+//  3. After healing, the minority nodes step down, their stale log entries are
+//     truncated, and all 5 nodes converge to the same log and config state.
 //
 // Timing budget (worst case < 15 s):
 //
@@ -189,20 +201,42 @@ func waitForCommitConvergence(t *testing.T, nodes []*clusterNode, minCommit int,
 //	3–4.2 s minority propose attempt (1.2 s timeout)
 //	4.2–8.2 s majority leader + commit (4 s budget)
 //	8.2–8.3 s heal
-//	8.3–13.3 s convergence (5 s budget)
+//	8.3–14.3 s convergence (state machine + log-length, 6 s total budget)
 func TestNetworkPartition(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping network-partition integration test in short mode")
 	}
 
-	nodes, transports, hostPorts := bootPartitionCluster(t, 5)
+	nodes, transports, hostPorts, applyChans := bootPartitionCluster(t, 5)
+	states := attachConfigStates(applyChans)
 
-	_ = waitForLeader(t, nodes, 3*time.Second)
+	// Identify the pre-partition leader so the partition is built around it.
+	origLeader := waitForLeader(t, nodes, 3*time.Second)
+	leaderIdx := -1
+	for i, n := range nodes {
+		if n.Node == origLeader.Node {
+			leaderIdx = i
+			break
+		}
+	}
 
-	// Partition: minority = nodes[0,1], majority = nodes[2,3,4].
-	// Apply symmetric block in both directions.
-	minority := []int{0, 1}
-	majority := []int{2, 3, 4}
+	// Minority = {origLeader, first non-leader node}.  This guarantees we always
+	// test the dangerous case: a partitioned leader with 2/5 nodes cannot commit.
+	minority := []int{leaderIdx}
+	for i := range nodes {
+		if i != leaderIdx && len(minority) < 2 {
+			minority = append(minority, i)
+		}
+	}
+	minoritySet := map[int]bool{minority[0]: true, minority[1]: true}
+	majority := make([]int, 0, 3)
+	for i := range nodes {
+		if !minoritySet[i] {
+			majority = append(majority, i)
+		}
+	}
+
+	// Apply symmetric partition: minority ↔ majority traffic is dropped.
 	for _, mi := range minority {
 		for _, mj := range majority {
 			transports[mi].block(hostPorts[mj])
@@ -210,19 +244,24 @@ func TestNetworkPartition(t *testing.T) {
 		}
 	}
 
-	// Assert minority cannot commit a new entry.
-	// nodes[0] may be a follower ("not leader" error) or the isolated leader
-	// (blocks until heal). Either outcome means minority cannot commit.
-	minCmd, _ := json.Marshal(lb.Command{Op: lb.OpAddBackend, URL: "http://minority:8001", Weight: 1})
-	minorityErr := proposeWithTimeout(nodes[0].Node, minCmd, 1200*time.Millisecond)
+	// Assert the isolated leader cannot commit.  Because nodes[leaderIdx] IS
+	// the leader, Propose will actually attempt replication — and block because
+	// it cannot reach a majority.  proposeWithTimeout enforces the time bound.
+	const staleURL = "http://minority:8001"
+	minCmd, _ := json.Marshal(lb.Command{Op: lb.OpAddBackend, URL: staleURL, Weight: 1})
+	minorityErr := proposeWithTimeout(nodes[leaderIdx].Node, minCmd, 1200*time.Millisecond)
 	if minorityErr == nil {
-		t.Fatal("minority partition committed an entry — split-brain detected")
+		t.Fatal("isolated leader committed an entry — split-brain detected")
 	}
 
 	// Assert majority elects a leader (or keeps the existing one) and can commit.
-	majorityNodes := nodes[2:]
+	majorityNodes := make([]*clusterNode, len(majority))
+	for i, mi := range majority {
+		majorityNodes[i] = nodes[mi]
+	}
 	majLeader := waitForLeaderAmong(t, majorityNodes, 4*time.Second)
-	majCmd, _ := json.Marshal(lb.Command{Op: lb.OpAddBackend, URL: "http://majority:8002", Weight: 1})
+	const goodURL = "http://majority:8002"
+	majCmd, _ := json.Marshal(lb.Command{Op: lb.OpAddBackend, URL: goodURL, Weight: 1})
 	if err := majLeader.Propose(majCmd); err != nil {
 		t.Fatalf("majority leader could not commit: %v", err)
 	}
@@ -236,14 +275,35 @@ func TestNetworkPartition(t *testing.T) {
 		}
 	}
 
-	// After healing, nodes[0] is drained via stepDown → drainPending.
-	// If it was still blocked, the error will arrive within a heartbeat interval.
-	// We already stored minorityErr above; nothing more to check here.
-
-	// Assert all 5 nodes converge to at least majCommit.
+	// CommitIndex convergence: all 5 nodes must reach majCommit.
 	waitForCommitConvergence(t, nodes, majCommit, 5*time.Second)
 
-	// Assert minority nodes stepped down (no stale leader in the minority).
+	// State-machine convergence: all 5 ConfigStates must apply the committed
+	// command.  This directly proves the majority's entry was applied everywhere.
+	waitForConvergence(t, states, 1, 2*time.Second)
+	for i, cs := range states {
+		if !hasBackend(cs, goodURL) {
+			t.Errorf("node %d: config state missing committed backend %s", i, goodURL)
+		}
+		// The stale command was never committed, so it must not appear in any
+		// node's state machine — verifying split-brain safety end-to-end.
+		if hasBackend(cs, staleURL) {
+			t.Errorf("node %d: config state contains uncommitted stale backend %s", i, staleURL)
+		}
+	}
+
+	// Log-length convergence: no node should have uncommitted tail entries.
+	// After heal, the minority leader's stale log entry is truncated by
+	// handleAppendEntries; all nodes should end up with LogLength == CommitIndex.
+	for i, n := range nodes {
+		s := n.Status()
+		if s.LogLength != s.CommitIndex {
+			t.Errorf("node %d: LogLength=%d != CommitIndex=%d (divergent log tail not cleaned up)",
+				i, s.LogLength, s.CommitIndex)
+		}
+	}
+
+	// Minority nodes must have stepped down after seeing a higher-term leader.
 	for _, mi := range minority {
 		if nodes[mi].IsLeader() {
 			t.Errorf("minority node %d is still leader after partition heal", mi)
@@ -251,18 +311,21 @@ func TestNetworkPartition(t *testing.T) {
 	}
 }
 
-// TestSplitBrainPrevention boots a 3-node cluster, isolates the leader, lets
-// the followers elect a new leader, and verifies that:
-//  1. The isolated leader cannot commit (no majority).
-//  2. The new majority leader can commit.
-//  3. After healing the isolated leader steps down and converges to the
-//     majority log — its uncommitted entry is overwritten and never applied.
+// TestSplitBrainPrevention boots a 3-node cluster, isolates the leader, and
+// verifies that:
+//
+//  1. The isolated leader cannot commit (only 1/3 nodes).
+//  2. The two followers elect a new higher-term leader and commit.
+//  3. After healing the original leader steps down, its uncommitted log entry
+//     is overwritten, and every node's config state contains only the majority
+//     leader's entry — proving the stale entry was never applied.
 func TestSplitBrainPrevention(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping split-brain integration test in short mode")
 	}
 
-	nodes, transports, hostPorts := bootPartitionCluster(t, 3)
+	nodes, transports, hostPorts, applyChans := bootPartitionCluster(t, 3)
+	states := attachConfigStates(applyChans)
 
 	// Identify the original leader (leaderA).
 	leaderA := waitForLeader(t, nodes, 3*time.Second)
@@ -292,14 +355,15 @@ func TestSplitBrainPrevention(t *testing.T) {
 	}
 	leaderB := waitForLeaderAmong(t, followerNodes, 3*time.Second)
 
-	// Attempt to commit on the isolated leaderA.
-	// It cannot replicate to a majority → should time out or return "not leader".
-	staleCmd, _ := json.Marshal(lb.Command{Op: lb.OpAddBackend, URL: "http://stale:8001", Weight: 1})
+	// Attempt to commit on the isolated leaderA (1/3 — no majority).
+	// proposeWithTimeout will time out; the goroutine drains via stepDown after heal.
+	const staleURL = "http://stale:8001"
+	staleCmd, _ := json.Marshal(lb.Command{Op: lb.OpAddBackend, URL: staleURL, Weight: 1})
 	staleErr := proposeWithTimeout(leaderA.Node, staleCmd, 1200*time.Millisecond)
-	// staleErr is only checked after heal below — record for deferred assertion.
 
-	// Commit on leaderB — must succeed (it has 2/3 majority).
-	goodCmd, _ := json.Marshal(lb.Command{Op: lb.OpAddBackend, URL: "http://good:8002", Weight: 1})
+	// Commit on leaderB — must succeed (2/3 majority).
+	const goodURL = "http://good:8002"
+	goodCmd, _ := json.Marshal(lb.Command{Op: lb.OpAddBackend, URL: goodURL, Weight: 1})
 	if err := leaderB.Propose(goodCmd); err != nil {
 		t.Fatalf("new majority leader could not commit: %v", err)
 	}
@@ -314,7 +378,7 @@ func TestSplitBrainPrevention(t *testing.T) {
 		transports[i].unblock(hostPorts[leaderIdx])
 	}
 
-	// Deferred assertion: stale propose must not have committed.
+	// The isolated leader's propose must not have committed.
 	if staleErr == nil {
 		t.Error("isolated leader committed an entry during partition — split-brain detected")
 	}
@@ -328,9 +392,33 @@ func TestSplitBrainPrevention(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if leaderA.IsLeader() {
-		t.Error("original leader should have stepped down after partition heal but is still leader")
+		t.Error("original leader did not step down after partition heal")
 	}
 
-	// All 3 nodes must converge to at least goodCommit (the majority's log).
+	// CommitIndex convergence: all 3 nodes must reach goodCommit.
 	waitForCommitConvergence(t, nodes, goodCommit, 5*time.Second)
+
+	// State-machine convergence: all 3 ConfigStates must have applied goodCmd
+	// and must NOT have applied staleCmd.  This is the key safety assertion:
+	// the stale entry was never committed, so it must never reach the state machine.
+	waitForConvergence(t, states, 1, 2*time.Second)
+	for i, cs := range states {
+		if !hasBackend(cs, goodURL) {
+			t.Errorf("node %d: config state missing committed backend %s", i, goodURL)
+		}
+		if hasBackend(cs, staleURL) {
+			t.Errorf("node %d: config state contains stale backend %s — split-brain entry was applied", i, staleURL)
+		}
+	}
+
+	// Log-length convergence: after leaderA's stale entry is truncated by
+	// handleAppendEntries, all nodes should have LogLength == CommitIndex with no
+	// divergent tail.
+	for i, n := range nodes {
+		s := n.Status()
+		if s.LogLength != s.CommitIndex {
+			t.Errorf("node %d: LogLength=%d != CommitIndex=%d (stale log entry not truncated)",
+				i, s.LogLength, s.CommitIndex)
+		}
+	}
 }
