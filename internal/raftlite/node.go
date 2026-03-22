@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -49,6 +50,9 @@ type Node struct {
 
 	stopCh chan struct{}
 	log    zerolog.Logger
+
+	raftClient *http.Client // used for vote + append RPCs (500 ms timeout)
+	snapClient *http.Client // used for install-snapshot RPCs (5 s timeout)
 }
 
 // NewNode creates and initialises a raftlite Node (does not start it).
@@ -108,6 +112,13 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 	}
 	rng := rand.New(rand.NewSource(seed))
 
+	transport := cfg.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	raftClient := &http.Client{Timeout: 500 * time.Millisecond, Transport: transport}
+	snapClient := &http.Client{Timeout: 5 * time.Second, Transport: transport}
+
 	n := &Node{
 		id:            cfg.ID,
 		dataDir:       cfg.DataDir,
@@ -128,14 +139,16 @@ func NewNode(cfg Config, applyCh chan LogEntry, proposeCh chan ProposeReq, logge
 			NextIndex:   make(map[string]int),
 			MatchIndex:  make(map[string]int),
 		},
-		role:      Follower,
-		rng:       rng,
-		applyCh:   applyCh,
-		proposeCh: proposeCh,
-		notifyCh:  make(chan struct{}, 1),
-		pending:   make(map[int]chan error),
-		stopCh:    make(chan struct{}),
-		log:       logger,
+		role:       Follower,
+		rng:        rng,
+		applyCh:    applyCh,
+		proposeCh:  proposeCh,
+		notifyCh:   make(chan struct{}, 1),
+		pending:    make(map[int]chan error),
+		stopCh:     make(chan struct{}),
+		log:        logger,
+		raftClient: raftClient,
+		snapClient: snapClient,
 	}
 	n.heartbeatTicker = time.NewTicker(heartbeatInterval)
 	n.electionTimer = time.NewTimer(n.randomElectionTimeout())
@@ -415,7 +428,7 @@ func (n *Node) startElection() {
 
 	for peerID, peerAddr := range n.peers {
 		go func(pid, addr string) {
-			reply, err := sendVote(addr, args)
+			reply, err := n.sendVote(addr, args)
 			if err != nil {
 				return
 			}
