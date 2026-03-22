@@ -2,7 +2,10 @@
 // It covers leader election, heartbeats, and log replication for config commands.
 package raftlite
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"net/http"
+)
 
 // Role represents a Raft node role.
 type Role int8
@@ -87,6 +90,9 @@ type Config struct {
 	// machine from a snapshot. Called before log replay on startup and before
 	// LastApplied advances on InstallSnapshot. Nil means no external state machine.
 	ApplySnapshot func(data []byte) error
+	// Transport is the http.RoundTripper used for all outbound Raft RPCs.
+	// Nil defaults to http.DefaultTransport. Override in tests to simulate partitions.
+	Transport http.RoundTripper
 }
 
 // RequestVoteArgs is the argument struct for RequestVote RPC.
